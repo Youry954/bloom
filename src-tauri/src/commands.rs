@@ -317,7 +317,8 @@ pub async fn sync_appbar(app: AppHandle) {
     crate::services::reconcile_main_appbar(&app);
     if let Some(dock_win) = app.get_webview_window("dock") {
         // Skip dock re-registration if dock is disabled in settings.
-        if dock_enabled() && DOCK_APPBAR_REGISTERED.load(Ordering::Relaxed) {
+        if dock_enabled() && get_setting_str(&app, "bloom-dock-mode").as_deref() == Some("fixed") {
+            // Repositionne le dock flottant, même sans enregistrement AppBar.
             register_dock_appbar(dock_win);
         } else {
             if let Ok(hwnd) = dock_win.hwnd() {
@@ -457,6 +458,9 @@ pub async fn change_dock_mode(app: AppHandle, mode: String) {
 pub async fn change_notch_mode(app: AppHandle, mode: String) {
     if let Some(main_win) = app.get_webview_window("main") {
         if mode == "fixed" {
+            // L'ancienne inscription AppBar affichait aussi la fenêtre.
+            // La nouvelle surcouche doit la montrer explicitement.
+            let _ = main_win.show();
             crate::services::apply_main_appbar_mode(&app, true);
         } else {
             let _ = main_win.show();

@@ -1,0 +1,50 @@
+name: Build Bloom Preview (Windows)
+
+on:
+  push:
+    branches:
+      - essai-notches-sans-bandes
+    paths:
+      - ".github/workflows/build-preview.yml"
+      - "src-tauri/src/services.rs"
+      - "src-tauri/src/commands.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-preview:
+    name: Vérification et exécutable Windows
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Installer Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Mettre le cache Rust en place
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Installer les dépendances
+        run: bun install --frozen-lockfile
+
+      - name: Construire Bloom sans installateur
+        run: bun run tauri build --no-bundle --ci
+
+      - name: Archiver uniquement l'application de test
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bloom-Preview-Windows
+          path: src-tauri/target/release/bloom.exe
+          if-no-files-found: error
+          retention-days: 7

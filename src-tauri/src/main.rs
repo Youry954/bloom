@@ -313,7 +313,10 @@ fn main() {
                 }
                 tauri::WindowEvent::ScaleFactorChanged { .. } => {
                     let h = handle_for_dock_events.clone();
-                    if DOCK_APPBAR_REGISTERED.load(Ordering::Relaxed) {
+                    if dock_enabled()
+                        && get_setting_str(&h, "bloom-dock-mode").as_deref() == Some("fixed")
+                    {
+                        // Même sans AppBar, le dock flottant suit les changements DPI.
                         let w = dock_for_events.clone();
                         tauri::async_runtime::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
