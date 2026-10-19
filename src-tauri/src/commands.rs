@@ -4405,10 +4405,48 @@ pub enum SystemAction {
     PowerOptions,
     NetworkConnections,
     TaskView,
+    Search,
 }
 
 #[tauri::command]
 pub async fn open_system_action(action: SystemAction) -> Result<(), String> {
+    // The compact Bloom search pill opens Windows Search (Win+S), not a
+    // separate file explorer search. Send the chord only after a user click.
+    if let SystemAction::Search = action {
+        return tauri::async_runtime::spawn_blocking(|| {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                SendInput, INPUT, INPUT_0, KEYBDINPUT, KEYEVENTF_KEYUP, INPUT_KEYBOARD, VK_LWIN,
+                VIRTUAL_KEY,
+            };
+            let vk_s = VIRTUAL_KEY(0x53);
+            let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: vk,
+                        wScan: 0,
+                        dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            let seq = [
+                key(VK_LWIN, false),
+                key(vk_s, false),
+                key(vk_s, true),
+                key(VK_LWIN, true),
+            ];
+            let sent = unsafe { SendInput(&seq, std::mem::size_of::<INPUT>() as i32) };
+            if sent != seq.len() as u32 {
+                Err("Windows Search could not be opened.".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     tauri::async_runtime::spawn_blocking(move || unsafe {
         use windows::Win32::UI::Shell::ShellExecuteW;
         use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -4445,6 +4483,8 @@ pub async fn open_system_action(action: SystemAction) -> Result<(), String> {
                 "explorer.exe".into(),
                 "shell:::{3080F90E-D7AD-11D9-BD98-0000947B0257}".into(),
             ),
+            // Search is handled above through the native Win+S shortcut.
+            SystemAction::Search => unreachable!(),
         };
         let file: Vec<u16> = file.encode_utf16().chain(Some(0)).collect();
         let args: Vec<u16> = args.encode_utf16().chain(Some(0)).collect();
