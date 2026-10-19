@@ -3676,8 +3676,9 @@ fn set_main_appbar_reservation(main_win: tauri::WebviewWindow, reserve: bool) {
 /// Whether the notch's 40px top strip should currently be reserved as an AppBar.
 /// Only fixed mode reserves screen space; smart and peek hide the notch freely.
 /// An unset mode defaults to fixed, matching SETTINGS.md and `re_register_appbars`.
-fn notch_mode_reserves_work_area(mode: Option<&str>) -> bool {
-    mode.map(|m| m == "fixed").unwrap_or(true)
+fn notch_mode_reserves_work_area(_mode: Option<&str>) -> bool {
+    // Un notch flottant ne modifie jamais la zone de travail Windows.
+    false
 }
 
 /// Bring the main AppBar registration in line with the configured notch mode.
@@ -3698,10 +3699,11 @@ pub fn reconcile_main_appbar(app: &AppHandle) {
 /// Apply an explicit mode to the main AppBar. `change_notch_mode` knows the
 /// target mode even when the settings cache has not caught up yet, so it cannot
 /// rely on a reconcile read.
-pub fn apply_main_appbar_mode(app: &AppHandle, reserve: bool) {
+pub fn apply_main_appbar_mode(app: &AppHandle, _reserve: bool) {
     let _guard = lock_main_appbar();
     if let Some(main_win) = app.get_webview_window("main") {
-        set_main_appbar_reservation(main_win, reserve);
+        // Le mode Fixed reste visible sans occuper la bande supérieure.
+        set_main_appbar_reservation(main_win, false);
     }
 }
 
@@ -3735,9 +3737,6 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
         let Ok(hwnd) = window.hwnd() else {
             return;
         };
-        let scale = monitor.scale_factor();
-        let bloom_scale = crate::utils::get_bloom_scale(window.app_handle());
-
         // ph = full physical window height. outer_size() can return 0 before the
         // window has rendered. Never guess a value — bail and let the retry wrapper handle it.
         let ph = window.outer_size().map(|s| s.height as i32).unwrap_or(0);
@@ -3752,8 +3751,6 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
             return;
         }
 
-        let pr = ((56.0 * bloom_scale) * scale) as i32;
-
         // Serialize with disable_dock_appbar, then check the setting again.
         // A pending registration must not outlive a dock-disable request.
         let _guard = lock_dock_appbar();
@@ -3763,12 +3760,8 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
 
         unsafe {
             use windows::Win32::Foundation::RECT;
-            use windows::Win32::UI::Shell::{
-                SHAppBarMessage, ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS,
-                APPBARDATA,
-            };
             use windows::Win32::UI::WindowsAndMessaging::{
-                GetWindowLongPtrW, GetWindowRect, RegisterWindowMessageW, SetWindowLongPtrW,
+                GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW,
                 SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
                 WS_EX_NOACTIVATE as WS_EX_NA, WS_EX_TOOLWINDOW,
             };
@@ -3778,46 +3771,16 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
             ex_style |= (WS_EX_TOOLWINDOW.0 | WS_EX_NA.0) as usize;
             let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style as isize);
 
-            let callback_message = RegisterWindowMessageW(windows::core::w!("BloomDockAppBar"));
-            if callback_message == 0 {
-                return;
-            }
-            let mut abd = APPBARDATA {
-                cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-                hWnd: hwnd,
-                uCallbackMessage: callback_message,
-                ..Default::default()
-            };
-
-            if !DOCK_APPBAR_REGISTERED.load(Ordering::Relaxed) {
-                let _ = SHAppBarMessage(ABM_REMOVE, &mut abd);
-                let registered = SHAppBarMessage(ABM_NEW, &mut abd);
-                crate::diagnostics::record(
-                    "dock_appbar",
-                    &format!("registration_result={registered}"),
-                );
-                if registered == 0 {
-                    eprintln!("Bloom: dock AppBar registration failed");
-                    return;
-                }
-                DOCK_APPBAR_REGISTERED.store(true, Ordering::Relaxed);
-            }
-
-            abd.uEdge = ABE_BOTTOM;
-            abd.rc = RECT {
-                left: m_pos.x,
-                top: m_pos.y + m_size.height as i32 - pr,
-                right: m_pos.x + m_size.width as i32,
-                bottom: m_pos.y + m_size.height as i32,
-            };
-
-            SHAppBarMessage(ABM_QUERYPOS, &mut abd);
-            SHAppBarMessage(ABM_SETPOS, &mut abd);
+            // Supprime une éventuelle ancienne réservation avant de repositionner
+            // le dock. Il reste flottant même lorsque son mode est Fixed.
+            unregister_appbar_native(hwnd);
+            DOCK_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
 
             // Critical: Force the window to the actual bottom of the screen,
             // ignoring what ABM_SETPOS might have tried to "correct" (like stacking on invisible taskbar)
             let final_y = m_pos.y + m_size.height as i32 - ph;
-            let final_width = abd.rc.right - abd.rc.left;
+            let final_x = m_pos.x;
+            let final_width = m_size.width as i32;
             if final_width <= 0 {
                 return;
             }
@@ -3827,7 +3790,7 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
             if GetWindowRect(hwnd, &mut current_rect).is_ok() {
                 let current_width = current_rect.right - current_rect.left;
                 let current_height = current_rect.bottom - current_rect.top;
-                if current_rect.left == abd.rc.left
+                if current_rect.left == final_x
                     && current_rect.top == final_y
                     && current_width == final_width
                     && current_height == ph
@@ -3840,7 +3803,7 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
                 && SetWindowPos(
                     hwnd,
                     None,
-                    abd.rc.left,
+                    final_x,
                     final_y,
                     final_width,
                     ph,
@@ -3852,7 +3815,7 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
             }
             let mut placed = RECT::default();
             if GetWindowRect(hwnd, &mut placed).is_err()
-                || placed.left != abd.rc.left
+                || placed.left != final_x
                 || placed.top != final_y
                 || placed.right - placed.left != final_width
                 || placed.bottom - placed.top != ph
