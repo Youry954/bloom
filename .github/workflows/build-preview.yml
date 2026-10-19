@@ -5,6 +5,7 @@ on:
     branches:
       - essai-notches-sans-bandes
       - correctif-recherche-ajout-dock
+      - bloom-3-recherche-tray-chatgpt
     paths:
       - ".github/workflows/build-preview.yml"
       - "src-tauri/src/services.rs"
@@ -13,6 +14,10 @@ on:
       - "src-tauri/src/state.rs"
       - "src-tauri/src/utils.rs"
       - "src/Dock.tsx"
+      - "public/brand-clean-whatsapp.svg"
+      - "public/brand-clean-chatgpt.svg"
+      - "src-tauri/src/tray.rs"
+      - "src/Dock.css"
   workflow_dispatch:
 
 permissions:
@@ -52,7 +57,7 @@ jobs:
       - name: Archiver uniquement l'application de test
         uses: actions/upload-artifact@v4
         with:
-          name: Bloom-Preview-Windows
+          name: Bloom-3-Preview-Windows
           path: src-tauri/target/release/bloom.exe
           if-no-files-found: error
           retention-days: 7
