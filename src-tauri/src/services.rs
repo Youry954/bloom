@@ -3673,21 +3673,15 @@ fn set_main_appbar_reservation(main_win: tauri::WebviewWindow, reserve: bool) {
     }
 }
 
-/// Whether the notch's 40px top strip should currently be reserved as an AppBar.
-/// Only fixed mode reserves screen space; smart and peek hide the notch freely.
-/// An unset mode defaults to fixed, matching SETTINGS.md and `re_register_appbars`.
+/// Le notch flotte au-dessus du bureau, quel que soit son mode.
+/// Ne réserve jamais la bande supérieure dans la zone de travail Windows.
 fn notch_mode_reserves_work_area(_mode: Option<&str>) -> bool {
     // Un notch flottant ne modifie jamais la zone de travail Windows.
     false
 }
 
-/// Bring the main AppBar registration in line with the configured notch mode.
-///
-/// `MAIN_APPBAR_REGISTERED` can drift from the setting: a DPI/scale change used
-/// to register the window unconditionally, and subsequent power/display events
-/// kept re-registering it from the stale flag, leaving the work-area gap in
-/// smart/peek mode until restart (issue #109). Deciding from the mode makes
-/// every re-registration path self-healing.
+/// Retire également toute ancienne réservation après un changement d'écran
+/// ou un réveil : une réservation Windows peut survivre au changement de mode.
 pub fn reconcile_main_appbar(app: &AppHandle) {
     let _guard = lock_main_appbar();
     let mode = get_setting_str(app, "bloom-notch-mode");
@@ -3776,8 +3770,8 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
             unregister_appbar_native(hwnd);
             DOCK_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
 
-            // Critical: Force the window to the actual bottom of the screen,
-            // ignoring what ABM_SETPOS might have tried to "correct" (like stacking on invisible taskbar)
+            // Position absolue : le dock reste en bas sans créer d'AppBar
+            // ni réduire la zone de travail des fenêtres maximisées.
             let final_y = m_pos.y + m_size.height as i32 - ph;
             let final_x = m_pos.x;
             let final_width = m_size.width as i32;
