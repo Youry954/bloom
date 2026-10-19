@@ -29,6 +29,8 @@ pub static NOTCH_IS_HOVERED: AtomicBool = AtomicBool::new(false);
 /// smart/peek mode the notch must stay click-through even over its footprint.
 pub static NOTCH_IS_VISIBLE: AtomicBool = AtomicBool::new(true);
 pub static MENU_IS_OPEN: AtomicBool = AtomicBool::new(false);
+/// Temporarily lets the dock receive keyboard input while Add App search is open.
+pub static DOCK_POPUP_FOCUS_ACTIVE: AtomicBool = AtomicBool::new(false);
 // The dock window's handle, for the mouse hook to tell whether a press lands
 // on the dock (which closes its own menus) or outside it.
 pub static DOCK_HWND: AtomicIsize = AtomicIsize::new(0);
