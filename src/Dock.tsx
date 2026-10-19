@@ -217,6 +217,7 @@ const Dock = memo(function Dock() {
 	const [trayItems, setTrayItems] = useState<TrayApp[]>([]);
 	const [trayIcons, setTrayIcons] = useState<Record<string, string>>({});
 	const [trayLoading, setTrayLoading] = useState(false);
+	const trayOpeningRef = useRef(false);
 	const [nativeMenuOpen, setNativeMenuOpen] = useState(false);
 	const [contextMenu, setContextMenu] = useState<{
 		x: number;
@@ -896,6 +897,7 @@ const Dock = memo(function Dock() {
 				if (active) {
 					setTrayLoading(false);
 					console.error("Could not enumerate system tray apps:", error);
+					showActionError(error);
 				}
 			}
 		};
@@ -908,11 +910,29 @@ const Dock = memo(function Dock() {
 		};
 	}, [showTrayPopup]);
 
-	const toggleTrayPopup = () => {
+	const toggleTrayPopup = async () => {
+		if (trayOpeningRef.current || nativeMenuOpen) return;
+		if (showTrayPopup) {
+			closePopup();
+			return;
+		}
+		trayOpeningRef.current = true;
 		setShowAddPopup(false);
-		setContextMenu(null);
-		setActiveSubmenu(null);
-		setShowTrayPopup((open) => !open);
+		closeMenu();
+		setPreviewData(null);
+		try {
+			if (await invoke<boolean>("uses_legacy_tray_overflow")) {
+				setNativeMenuOpen(true);
+				await invoke("show_legacy_tray_overflow");
+			} else {
+				setShowTrayPopup(true);
+			}
+		} catch (error) {
+			showActionError(error);
+		} finally {
+			trayOpeningRef.current = false;
+			setNativeMenuOpen(false);
+		}
 	};
 
 	// A press outside the dock while a menu or the Add App popup is open. The
@@ -1449,10 +1469,10 @@ const Dock = memo(function Dock() {
 									className={`dock-tray-toggle${showTrayPopup ? " is-open" : ""}`}
 									title="Applications en arrière-plan"
 									aria-label="Afficher les applications en arrière-plan"
-									aria-expanded={showTrayPopup}
+									aria-expanded={showTrayPopup || nativeMenuOpen}
 									onClick={(e) => {
 										e.stopPropagation();
-										toggleTrayPopup();
+										void toggleTrayPopup();
 									}}
 								>
 									<ChevronUp size={18} aria-hidden="true" />

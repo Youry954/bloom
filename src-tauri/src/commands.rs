@@ -4379,6 +4379,20 @@ mod pwa_icon_tests {
 }
 
 #[tauri::command]
+pub async fn uses_legacy_tray_overflow() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(crate::tray::uses_legacy_overflow)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn show_legacy_tray_overflow() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(crate::tray::show_legacy_overflow)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn get_tray_apps() -> Vec<crate::tray::TrayApp> {
     tauri::async_runtime::spawn_blocking(crate::tray::enumerate)
         .await

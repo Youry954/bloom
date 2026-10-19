@@ -6,6 +6,7 @@ on:
       - essai-notches-sans-bandes
       - correctif-recherche-ajout-dock
       - bloom-3-recherche-tray-chatgpt
+      - test/bloom-3-tray-arrow-fix
     paths:
       - ".github/workflows/build-preview.yml"
       - "src-tauri/src/services.rs"
@@ -39,6 +40,8 @@ jobs:
 
       - name: Installer Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Mettre le cache Rust en place
         uses: Swatinem/rust-cache@v2
@@ -51,13 +54,28 @@ jobs:
       - name: Vérifier la compilation du frontend
         run: bun run build
 
+      - name: Tester le dock et les régions des fenêtres
+        run: bun test scripts/*.test.ts
+
+      - name: Vérifier Rust
+        run: cargo check --locked
+        working-directory: src-tauri
+
+      - name: Vérifier Clippy
+        run: cargo clippy --locked --all-targets
+        working-directory: src-tauri
+
+      - name: Tester Rust
+        run: cargo test --locked
+        working-directory: src-tauri
+
       - name: Construire Bloom sans installateur
         run: bun run tauri build --no-bundle --ci
 
       - name: Archiver uniquement l'application de test
         uses: actions/upload-artifact@v4
         with:
-          name: Bloom-3-Preview-Windows
+          name: Bloom-3-Tray-Fix-Windows-${{ github.sha }}
           path: src-tauri/target/release/bloom.exe
           if-no-files-found: error
           retention-days: 7

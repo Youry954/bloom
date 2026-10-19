@@ -247,6 +247,123 @@ pub fn enumerate() -> Vec<TrayApp> {
     }
 }
 
+/// Windows 11 21H2 (and the classic tray) has no NotifyIconSettings catalog.
+/// Its empty discovery result does not mean that no background apps are running.
+pub fn uses_legacy_overflow() -> bool {
+    unsafe { open_key(HKEY_CURRENT_USER, "Control Panel\\NotifyIconSettings").is_none() }
+}
+
+fn overflow_position(anchor: POINT, width: i32, height: i32, area: RECT) -> (i32, i32) {
+    (
+        (anchor.x - width / 2).clamp(area.left, (area.right - width).max(area.left)),
+        (anchor.y - height - 12).clamp(area.top, (area.bottom - height).max(area.top)),
+    )
+}
+
+/// Own only the classic popup, never the taskbar, AppBars or icon preferences.
+struct LegacyOverflow {
+    hwnd: HWND,
+    rect: RECT,
+    was_visible: bool,
+    was_topmost: bool,
+}
+
+impl Drop for LegacyOverflow {
+    fn drop(&mut self) {
+        unsafe {
+            if IsWindow(Some(self.hwnd)).as_bool() {
+                if !self.was_visible {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(if self.was_topmost { HWND_TOPMOST } else { HWND_NOTOPMOST }),
+                    self.rect.left,
+                    self.rect.top,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+        crate::state::TRAY_INTERACTION_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Let Explorer draw and handle its real classic icons, including right-click
+/// menus. No registry guesses, process-memory reads or translated button labels.
+pub fn show_legacy_overflow() -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::WPARAM;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON};
+
+    unsafe {
+        if crate::state::SHUTTING_DOWN.load(Ordering::Relaxed) {
+            return Err("Bloom est en cours de fermeture.".into());
+        }
+        let hwnd = FindWindowW(w!("NotifyIconOverflowWindow"), PCWSTR::null())
+            .map_err(|_| "Le panneau des icônes Windows est indisponible. Réessayez après le démarrage d’Explorer.")?;
+        let toolbar = FindWindowExW(Some(hwnd), None, w!("ToolbarWindow32"), PCWSTR::null())
+            .map_err(|_| "Cette version du panneau Windows n’est pas prise en charge.")?;
+        // TB_BUTTONCOUNT (WM_USER + 24), bounded if Explorer is not responding.
+        let mut count = 0usize;
+        if SendMessageTimeoutW(toolbar, WM_USER + 24, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 1000, Some(&mut count)).0 == 0 {
+            return Err("Le panneau des icônes Windows ne répond pas.".into());
+        }
+        if count == 0 {
+            return Err("Windows ne signale aucune icône masquée.".into());
+        }
+        let mut rect = RECT::default();
+        GetWindowRect(hwnd, &mut rect).map_err(|e| e.to_string())?;
+        let mut anchor = POINT::default();
+        GetCursorPos(&mut anchor).map_err(|e| e.to_string())?;
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            return Err("Impossible de positionner le panneau Windows sur cet écran.".into());
+        }
+        if crate::state::TRAY_INTERACTION_ACTIVE.swap(true, Ordering::SeqCst) {
+            return Err("Un menu de notification est déjà ouvert.".into());
+        }
+        let _guard = LegacyOverflow {
+            hwnd, rect,
+            was_visible: IsWindowVisible(hwnd).as_bool(),
+            was_topmost: GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0,
+        };
+        let (x, y) = overflow_position(anchor, rect.right - rect.left, rect.bottom - rect.top, info.rcMonitor);
+        SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            .map_err(|e| e.to_string())?;
+        let _ = SetForegroundWindow(hwnd);
+        // Explorer normally dismisses itself. Also handle outside presses when
+        // Windows denies focus to the non-activating dock, and Escape reliably.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let down = || GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0;
+        let mut was_down = down();
+        while std::time::Instant::now() < deadline
+            && IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool()
+            && !crate::state::SHUTTING_DOWN.load(Ordering::Relaxed)
+            && crate::utils::dock_enabled()
+        {
+            if GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 { break; }
+            let pressed = down();
+            if pressed && !was_down {
+                let mut point = POINT::default();
+                let mut bounds = RECT::default();
+                if GetCursorPos(&mut point).is_ok() && GetWindowRect(hwnd, &mut bounds).is_ok()
+                    && (point.x < bounds.left || point.x >= bounds.right || point.y < bounds.top || point.y >= bounds.bottom)
+                {
+                    break;
+                }
+            }
+            was_down = pressed;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Ok(())
+    }
+}
+
 struct ComApartment;
 impl ComApartment {
     unsafe fn new() -> Result<Self, String> {
@@ -800,6 +917,23 @@ pub fn interact(key: &str, context_menu: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_overflow_stays_above_the_clicked_dock_on_its_monitor() {
+        let monitor = RECT { left: -1920, top: 0, right: 0, bottom: 1080 };
+        assert_eq!(overflow_position(POINT { x: -960, y: 1040 }, 300, 200, monitor), (-1110, 828));
+        assert_eq!(overflow_position(POINT { x: -1910, y: 1040 }, 300, 200, monitor), (-1920, 828));
+        assert_eq!(overflow_position(POINT { x: -10, y: 1040 }, 300, 200, monitor), (-300, 828));
+    }
+
+    #[test]
+    fn legacy_overflow_clamps_to_small_and_scaled_displays() {
+        let monitor = RECT { left: 0, top: 0, right: 800, bottom: 600 };
+        assert_eq!(overflow_position(POINT { x: 400, y: 100 }, 300, 200, monitor), (250, 0));
+        assert_eq!(overflow_position(POINT { x: 400, y: 550 }, 900, 700, monitor), (0, 0));
+        let scaled = RECT { left: 1920, top: -200, right: 4480, bottom: 1240 };
+        assert_eq!(overflow_position(POINT { x: 4400, y: 1200 }, 450, 300, scaled), (4030, 888));
+    }
+
     #[test]
     #[ignore = "read-only check against the current Windows desktop"]
     fn live_tray_discovery() {
