@@ -317,7 +317,8 @@ pub async fn sync_appbar(app: AppHandle) {
     crate::services::reconcile_main_appbar(&app);
     if let Some(dock_win) = app.get_webview_window("dock") {
         // Skip dock re-registration if dock is disabled in settings.
-        if dock_enabled() && DOCK_APPBAR_REGISTERED.load(Ordering::Relaxed) {
+        if dock_enabled() && get_setting_str(&app, "bloom-dock-mode").as_deref() == Some("fixed") {
+            // Repositionne le dock flottant, même sans enregistrement AppBar.
             register_dock_appbar(dock_win);
         } else {
             if let Ok(hwnd) = dock_win.hwnd() {
