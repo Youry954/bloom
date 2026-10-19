@@ -105,6 +105,21 @@ const fileOf = (p: string) =>
 // running in the same browser must never be matched by their shared exe name.
 const isIdentifier = (p: string) => !p.includes("/") && !p.includes("\\");
 
+// Windows Store icons can contain an opaque blue/white plate baked into the
+// image itself. For these two known apps use clean transparent vector marks
+// instead of trying to cut pixels out of arbitrary user icons.
+function cleanBrandIcon(app: AppInfo): string | null {
+	const name = app.name.trim().toLowerCase();
+	const path = app.path.toLowerCase();
+	if (name === "chatgpt" || name === "chat gpt" || /openai\.chatgpt|chatgpt\.exe|chatgpt_/.test(path)) {
+		return "/brand-clean-chatgpt.svg";
+	}
+	if (name === "whatsapp" || /whatsapp\.exe|whatsappdesktop|whatsapp_/.test(path)) {
+		return "/brand-clean-whatsapp.svg";
+	}
+	return null;
+}
+
 // Resolve the configured start-button icon to a public asset, or to the data
 // URI of a user-uploaded icon (stored with a "custom:" prefix).
 // Task View's glyph: a window in front of another, as on the taskbar.
@@ -1628,7 +1643,9 @@ const Dock = memo(function Dock() {
 														// browser and its PWAs share one path, so it would leak one item's
 														// icon onto the others.
 														const allowPathFallback = !isHost || !app.is_running;
+														const brandIcon = cleanBrandIcon(app);
 														const icon =
+															brandIcon ||
 															customIcons[cacheKey] ||
 															(allowPathFallback && customIcons[app.path]) ||
 															iconsRef.current[cacheKey] ||
@@ -1644,7 +1661,7 @@ const Dock = memo(function Dock() {
 															<img
 																src={icon}
 																alt={app.name}
-																className={isBloomOrSettings ? "bloom-icon-img" : ""}
+																className={brandIcon ? "dock-brand-icon" : isBloomOrSettings ? "bloom-icon-img" : ""}
 																draggable={false}
 															/>
 														) : (
@@ -1787,7 +1804,9 @@ const Dock = memo(function Dock() {
 												// browser and its PWAs share one path, so it would leak one item's
 												// icon onto the others.
 												const allowPathFallback = !isHost || !app.is_running;
+												const brandIcon = cleanBrandIcon(app);
 												const icon =
+													brandIcon ||
 													customIcons[cacheKey] ||
 													(allowPathFallback && customIcons[app.path]) ||
 													iconsRef.current[cacheKey] ||
@@ -1801,7 +1820,7 @@ const Dock = memo(function Dock() {
 													<img
 														src={icon}
 														alt={app.name}
-														className={isBloomOrSettings ? "bloom-icon-img" : ""}
+														className={brandIcon ? "dock-brand-icon" : isBloomOrSettings ? "bloom-icon-img" : ""}
 														draggable={false}
 													/>
 												) : (
