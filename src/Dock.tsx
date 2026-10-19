@@ -244,6 +244,25 @@ const Dock = memo(function Dock() {
 		}
 	}, [showAddPopup, scale]);
 
+	// The dock normally uses a non-activating window, which is ideal for icons
+	// but prevents native keyboard input in the Add App search. Temporarily
+	// enable real focus while the popup exists and restore it on unmount.
+	useEffect(() => {
+		if (!showAddPopup) return;
+		let mounted = true;
+		invoke("set_dock_popup_focus", { active: true })
+			.then(() => {
+				if (mounted) {
+					document.querySelector<HTMLInputElement>(".popup-search-input")?.focus();
+				}
+			})
+			.catch((error) => console.error("Could not focus Add App search:", error));
+		return () => {
+			mounted = false;
+			invoke("set_dock_popup_focus", { active: false }).catch(() => {});
+		};
+	}, [showAddPopup]);
+
 	const isCurrentlyHovered = isDockHovered || isEdgeHovered;
 	const [interactionState, setInteractionState] = useState<"active" | "grace" | "none">("none");
 	const isAnyInteraction = isCurrentlyHovered || !!contextMenu || showAddPopup || nativeMenuOpen;
@@ -907,11 +926,16 @@ const Dock = memo(function Dock() {
 			open = true;
 		} else if (showAddPopup && popupRef.current) {
 			const r = popupRef.current.getBoundingClientRect();
+			const anchor = popupRef.current.parentElement?.getBoundingClientRect();
+			// The popup animates from scaleY(0), so its transformed height is
+			// briefly tiny. Use the full untransformed anchor for hit testing:
+			// otherwise the first click in search is seen as "outside" and
+			// dismisses the popup through the native mouse hook.
 			rect = {
 				x: Math.round(r.x),
-				y: Math.round(r.y),
+				y: Math.round(anchor?.top ?? r.top),
 				width: Math.round(r.width),
-				height: Math.round(r.height)
+				height: Math.round(anchor?.height ?? r.height)
 			};
 			open = true;
 		}
