@@ -1645,9 +1645,9 @@ const Dock = memo(function Dock() {
 														const allowPathFallback = !isHost || !app.is_running;
 														const brandIcon = cleanBrandIcon(app);
 														const icon =
-															brandIcon ||
 															customIcons[cacheKey] ||
 															(allowPathFallback && customIcons[app.path]) ||
+															brandIcon ||
 															iconsRef.current[cacheKey] ||
 															(allowPathFallback && iconsRef.current[app.path]) ||
 															app.icon;
@@ -1806,9 +1806,9 @@ const Dock = memo(function Dock() {
 												const allowPathFallback = !isHost || !app.is_running;
 												const brandIcon = cleanBrandIcon(app);
 												const icon =
-													brandIcon ||
 													customIcons[cacheKey] ||
 													(allowPathFallback && customIcons[app.path]) ||
+													brandIcon ||
 													iconsRef.current[cacheKey] ||
 													(allowPathFallback && iconsRef.current[app.path]) ||
 													app.icon;
