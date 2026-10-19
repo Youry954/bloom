@@ -8,33 +8,15 @@ import { initTheme } from "./theme";
 import { useSettingsSync } from "./hooks/useSettingsSync";
 import { reloadIfMirrorWasStale } from "./hooks/settingsMirror";
 
-import { mergeTrayApps, selectDockTrayApps, type AppInfo, type TrayApp } from "./dockApps";
+import { appIdentity, isBrowserHost, isBrowserBackedApp, isSameApp, mergeTrayApps, selectDockTrayApps, type AppInfo, type TrayApp } from "./dockApps";
 import { driveLetter, hideDrive, removeCustomFolder, type DockExtra } from "./dockExtras";
 import { createRegionSender, measureElements, padRect, type RegionRect } from "./windowRegion";
 
-// Host processes (Edge/Chrome/Brave/ApplicationFrameHost) run every PWA/UWP
-// window, so their window title must be part of their identity — otherwise two
-// PWAs running under the same browser collapse into a single dock item.
-const HOST_PROCESSES = ["msedge.exe", "chrome.exe", "brave.exe", "applicationframehost.exe"];
-export function isBrowserHost(path: string) {
-	const p = path.toLowerCase();
-	return HOST_PROCESSES.some((host) => p.includes(host));
-}
-
-// Stable identity for a dock item.
-export function appIdentity(p: string, executable?: string, name?: string) {
-	if (!p) return "";
-	const normalized = p.toLowerCase().replace(/\\/g, "/");
-	// Shell application ids (AUMIDs) and bare names are unique on their own.
-	if (!normalized.includes("/")) return normalized;
-	if (name && isBrowserHost(normalized)) {
-		return `${normalized}:${name.toLowerCase()}`;
-	}
-	if (executable) return `${normalized}:${executable.toLowerCase()}`;
-	return normalized;
-}
-
+// Dock-local keys and normalization reused by icon/layout logic.
 const itemKey = (app: AppInfo) => appIdentity(app.path, app.executable, app.name);
+const fileOf = (p: string) =>
+	(p.split("/").pop()?.split("\\").pop()?.toLowerCase() || "").replace(/\.lnk$/, "");
+const isIdentifier = (p: string) => !p.includes("/") && !p.includes("\\");
 
 // WinEvent notifications can arrive for windows that do not change the dock.
 // Keep the existing array when its visible content is identical so Framer
@@ -58,51 +40,6 @@ function sameRunningApps(left: AppInfo[], right: AppInfo[]): boolean {
 		})
 	);
 }
-
-// Fuzzy identity: a running window and its installed/pinned entry often carry
-// different paths (exe vs .lnk vs AUMID), so exact keys miss and the same app
-// looks pinnable twice. Mirrors the dock list's own pinned↔running matching.
-export function isSameApp(a: AppInfo, b: AppInfo): boolean {
-	if (!a.path || !b.path) return false;
-	if (itemKey(a) === itemKey(b)) return true;
-	// Browser hosts run many apps under one exe — only the full identity
-	// (which folds in the window/AUMID name) can match those.
-	if (isBrowserHost(a.path) || isBrowserHost(b.path)) return false;
-	const aId = isIdentifier(a.path);
-	const bId = isIdentifier(b.path);
-	// Two opaque shell ids match only exactly (checked above).
-	if (aId && bId) return false;
-	if (aId !== bId) {
-		// One side is a shell id (AUMID), the other a file path. AUMIDs embed
-		// the product name (ZedIndustries.Zed, com.squirrel.Figma.Figma), so
-		// match on overlapping display names plus id/stem cross-containment.
-		// This is the common shape: installed entries come from the AppsFolder
-		// scan (AUMID) while pinned entries are exe/.lnk paths.
-		const fileSide = aId ? b : a;
-		const idLower = (aId ? a : b).path.toLowerCase();
-		const na = a.name.toLowerCase();
-		const nb = b.name.toLowerCase();
-		if (na !== nb && !na.includes(nb) && !nb.includes(na)) return false;
-		const stem = (fileSide.executable?.toLowerCase() || fileOf(fileSide.path)).replace(
-			/\.(exe|lnk)$/,
-			""
-		);
-		return stem.length >= 3 && idLower.includes(stem);
-	}
-	if (appIdentity(a.path) === appIdentity(b.path)) return true;
-	const normExe = (s: string) => (s.endsWith(".exe") ? s : `${s}.exe`);
-	const aExe = a.executable?.toLowerCase() || fileOf(a.path);
-	const bExe = b.executable?.toLowerCase() || fileOf(b.path);
-	if (!aExe || !bExe) return false;
-	return normExe(aExe) === normExe(bExe);
-}
-
-const fileOf = (p: string) =>
-	(p.split("/").pop()?.split("\\").pop()?.toLowerCase() || "").replace(/\.lnk$/, "");
-
-// Shell application ids (AUMIDs) identify one specific app; two different PWAs
-// running in the same browser must never be matched by their shared exe name.
-const isIdentifier = (p: string) => !p.includes("/") && !p.includes("\\");
 
 // Resolve the configured start-button icon to a public asset, or to the data
 // URI of a user-uploaded icon (stored with a "custom:" prefix).
@@ -945,6 +882,21 @@ const Dock = memo(function Dock() {
 				return running;
 			}
 
+			// A shortcut and its running window may use different identities
+			// (.lnk / AUMID / exe). Match by app identity *before* executable
+			// fallbacks, especially for browsers hosting unrelated PWAs.
+			const equivalent = activeApps.find(
+				(app) => !matchedRunningKeys.has(itemKey(app)) && isSameApp(p, app)
+			);
+			if (equivalent) {
+				matchedRunningKeys.add(itemKey(equivalent));
+				return equivalent;
+			}
+
+			// A browser process can host many distinct apps: never match it
+			// to a pinned item by executable basename alone.
+			if (isBrowserBackedApp(p)) return undefined;
+
 			// 3. Try fallback match by executable name if defined
 			if (p.executable) {
 				const targetExe = p.executable.toLowerCase();
@@ -978,16 +930,6 @@ const Dock = memo(function Dock() {
 				}
 			}
 
-			// A pinned shell id and a visible window can have different paths
-			// (for example com.sehaz.bloom and bloom.exe). Match both visible
-			// and background apps so the window cannot become a second dock item.
-			const equivalent = activeApps.find(
-				(app) => !matchedRunningKeys.has(itemKey(app)) && isSameApp(p, app)
-			);
-			if (equivalent) {
-				matchedRunningKeys.add(itemKey(equivalent));
-				return equivalent;
-			}
 			return undefined;
 		};
 
