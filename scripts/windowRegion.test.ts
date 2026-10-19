@@ -1,12 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
 	clipToWindow,
+	computeDockBarRect,
 	createRegionSender,
+	DOCK_MAXIMIZED_GAP_PX,
 	nextRegion,
 	notchPillBox,
 	padRect,
-	type RegionState
-} from "../src/windowRegion";
+	type RegionState,
+	untransformedPopupBox
+} from "../src/dockRegion";
 
 const empty: RegionState = { key: "", current: [], held: [] };
 
@@ -119,4 +122,42 @@ describe("window region", () => {
 		expect(b.changed).toBe(true);
 		expect(b.rects).toEqual(rects);
 	});
+
+	test("computes expanded dock region and untransformed popup box for elastic animations", () => {
+		expect(DOCK_MAXIMIZED_GAP_PX).toBe(4);
+		const normal = computeDockBarRect({
+			windowWidth: 1920,
+			windowHeight: 500,
+			dockRect: { x: 660, y: 448, width: 600, height: 52 },
+			isVisible: true,
+			isExpanded: true,
+			isHidden: false,
+			isDockedExpanded: false,
+			adaptiveWidth: false
+		});
+		expect(normal).toEqual([{ x: 646, y: 434, width: 628, height: 80 }]);
+
+		const expanded = computeDockBarRect({
+			windowWidth: 1920,
+			windowHeight: 500,
+			dockRect: { x: 624, y: 448, width: 672, height: 52 },
+			isVisible: true,
+			isExpanded: true,
+			isHidden: false,
+			isDockedExpanded: true,
+			adaptiveWidth: false
+		});
+		expect(expanded).toEqual([{ x: 608, y: 432, width: 704, height: 84 }]);
+
+		// A popup mid-animation at scaleX=0.3, scaleY=0.1 still covers its full 380x320 target box
+		const popupRect = untransformedPopupBox(
+			{ x: 903, y: 420, width: 114, height: 32 },
+			380,
+			320,
+			16
+		);
+		expect(popupRect.width).toBeGreaterThanOrEqual(380 + 32);
+		expect(popupRect.height).toBeGreaterThanOrEqual(320 + 32);
+	});
 });
+

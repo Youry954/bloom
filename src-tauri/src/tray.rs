@@ -321,6 +321,36 @@ fn legacy_overflow_dimensions(
     ((tb_w + pad_w, tb_h + pad_h), (tb_w, tb_h))
 }
 
+/// Calcule une étape d'interpolation élastique (courbe ease-out + léger rebond de ressort)
+/// pour faire émerger `NotifyIconOverflowWindow` depuis le bouton de la flèche ↑ du Dock.
+fn interpolate_overflow_frame(
+    anchor: POINT,
+    final_x: i32,
+    final_y: i32,
+    final_w: i32,
+    final_h: i32,
+    progress: f64,
+) -> (i32, i32, i32, i32) {
+    let t = progress.clamp(0.0, 1.0);
+    if (t - 1.0).abs() < f64::EPSILON {
+        return (final_x, final_y, final_w.max(1), final_h.max(1));
+    }
+    let inv = 1.0 - t;
+    let ease = 1.0 - inv * inv * inv + 0.06 * (t * std::f64::consts::PI).sin() * inv;
+
+    let start_w = ((final_w as f64) * 0.35).round().max(36.0);
+    let start_h = ((final_h as f64) * 0.18).round().max(24.0);
+    let start_x = (anchor.x as f64 - start_w / 2.0).round();
+    let start_y = ((final_y + final_h) as f64 - start_h + 20.0).round();
+
+    let cur_w = (start_w + (final_w as f64 - start_w) * ease).round() as i32;
+    let cur_h = (start_h + (final_h as f64 - start_h) * ease).round() as i32;
+    let cur_x = (start_x + (final_x as f64 - start_x) * ease).round() as i32;
+    let cur_y = (start_y + (final_y as f64 - start_y) * ease).round() as i32;
+
+    (cur_x, cur_y, cur_w.max(1), cur_h.max(1))
+}
+
 /// Own only the classic popup, never the taskbar, AppBars or icon preferences.
 struct LegacyOverflow {
     hwnd: HWND,
@@ -466,16 +496,31 @@ pub fn show_legacy_overflow() -> Result<(), String> {
             tb_h,
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
-        SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            x,
-            y,
-            width,
-            height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
-        .map_err(|e| e.to_string())?;
+        // Animation d'interpolation Win32 (~150ms) depuis la position du bouton du Dock
+        const STEPS: usize = 9;
+        for step in 1..=STEPS {
+            let t = step as f64 / STEPS as f64;
+            let (cur_x, cur_y, cur_w, cur_h) =
+                interpolate_overflow_frame(anchor, x, y, width, height, t);
+            let flags = if step == 1 {
+                SWP_NOACTIVATE | SWP_SHOWWINDOW
+            } else {
+                SWP_NOACTIVATE
+            };
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                cur_x,
+                cur_y,
+                cur_w,
+                cur_h,
+                flags,
+            )
+            .map_err(|e| e.to_string())?;
+            if step < STEPS {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+        }
         let _ = SetWindowPos(
             toolbar,
             None,
@@ -1165,5 +1210,18 @@ mod tests {
             "C:\\Windows\\System32\\SecurityHealthSystray.exe"
         ));
         assert!(!is_explorer_hosted_icon("C:\\Apps\\Discord.exe"));
+    }
+
+    #[test]
+    fn overflow_interpolation_starts_compact_near_anchor_and_lands_exact() {
+        let anchor = POINT { x: 960, y: 1040 };
+        let (sx, sy, sw, sh) = interpolate_overflow_frame(anchor, 870, 788, 180, 240, 0.1);
+        assert!(sw < 180 && sh < 240);
+        assert!(sy > 788);
+        assert!(sx > 870);
+        assert_eq!(
+            interpolate_overflow_frame(anchor, 870, 788, 180, 240, 1.0),
+            (870, 788, 180, 240)
+        );
     }
 }

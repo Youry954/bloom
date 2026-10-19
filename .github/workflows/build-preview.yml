@@ -20,6 +20,8 @@ on:
       - "public/brand-clean-chatgpt.svg"
       - "src-tauri/src/tray.rs"
       - "src/Dock.css"
+      - "src/dockRegion.ts"
+      - "scripts/windowRegion.test.ts"
   workflow_dispatch:
 
 permissions:

@@ -213,13 +213,17 @@ body {
 	z-index: 2;
 	transform-origin: bottom center;
 	pointer-events: auto;
-	transition: padding 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+	transition: box-shadow 0.3s cubic-bezier(0.32, 0.72, 0, 1);
 	overflow: visible;
 	/* Re-enable pointer events for the dock itself */
 }
 
 .dock.dock-impacted {
 	padding: 8px 14px;
+}
+
+.dock.dock-maximized-expanded {
+	padding: 8px 28px;
 }
 
 .dock-reorder-container {
@@ -980,7 +984,10 @@ body {
 }
 
 
-/* Bloom 3.0: compact Windows-style search, without changing the dock shell. */
+/* Bloom 3.0 Unified Glassmorphism System Controls: Start, Search, and System Tray Arrow */
+.dock-system-pill,
+.dock-start-btn,
+.dock-icon-only .dock-icon.dock-start-btn,
 .dock-search-pill,
 .dock-tray-toggle {
 	appearance: none;
@@ -988,62 +995,214 @@ body {
 	font-family: inherit;
 	border: 1px solid color-mix(in srgb, var(--bloom-text, white) 18%, transparent);
 	color: var(--bloom-text, white);
-	background: color-mix(in srgb, var(--bloom-text, white) 8%, transparent);
-	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-	height: 31px;
+	background: linear-gradient(
+		135deg,
+		color-mix(in srgb, var(--bloom-text, white) 14%, transparent) 0%,
+		color-mix(in srgb, var(--bloom-text, white) 6%, transparent) 100%
+	);
+	backdrop-filter: blur(18px) saturate(1.45);
+	-webkit-backdrop-filter: blur(18px) saturate(1.45);
+	box-shadow:
+		inset 0 1px 0 rgba(255, 255, 255, 0.14),
+		0 4px 12px rgba(0, 0, 0, 0.14);
 	cursor: pointer;
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
 	flex: none;
 	-webkit-app-region: no-drag;
-	transition: background 150ms ease, transform 150ms ease, border-color 150ms ease;
+	transition:
+		background 180ms cubic-bezier(0.22, 1, 0.36, 1),
+		border-color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+		box-shadow 180ms cubic-bezier(0.22, 1, 0.36, 1);
 }
+
+.dock-start-btn,
+.dock-icon-only .dock-icon.dock-start-btn {
+	width: 36px;
+	height: 36px;
+	border-radius: 12px;
+}
+
 .dock-search-pill {
+	height: 34px;
 	border-radius: 999px;
 	gap: 7px;
-	min-width: 92px;
-	max-width: 115px;
-	padding: 0 12px;
+	min-width: 98px;
+	max-width: 120px;
+	padding: 0 13px;
 	font-size: 12px;
 	font-weight: 500;
+	letter-spacing: -0.01em;
 	white-space: nowrap;
 }
+
 .dock-tray-toggle {
-	width: 31px;
-	border-radius: 11px;
+	width: 34px;
+	height: 34px;
+	border-radius: 12px;
 	padding: 0;
 }
+
+.dock-start-btn:hover,
+.dock-icon-only .dock-icon.dock-start-btn:hover,
 .dock-search-pill:hover,
+.dock-search-pill.is-open,
 .dock-tray-toggle:hover,
 .dock-tray-toggle.is-open {
-	background: color-mix(in srgb, var(--bloom-text, white) 17%, transparent);
-	border-color: color-mix(in srgb, var(--bloom-text, white) 35%, transparent);
+	background: linear-gradient(
+		135deg,
+		color-mix(in srgb, var(--bloom-accent, #5b9bff) 22%, color-mix(in srgb, var(--bloom-text, white) 18%, transparent)) 0%,
+		color-mix(in srgb, var(--bloom-accent, #5b9bff) 10%, color-mix(in srgb, var(--bloom-text, white) 10%, transparent)) 100%
+	);
+	border-color: color-mix(in srgb, var(--bloom-accent, #5b9bff) 52%, color-mix(in srgb, var(--bloom-text, white) 35%, transparent));
+	box-shadow:
+		inset 0 1px 0 rgba(255, 255, 255, 0.24),
+		0 6px 16px rgba(0, 0, 0, 0.2),
+		0 0 14px color-mix(in srgb, var(--bloom-accent, #5b9bff) 24%, transparent);
 }
-.dock-search-pill:active,
-.dock-tray-toggle:active { transform: scale(0.94); }
+
 .dock-search-pill:focus-visible,
 .dock-tray-toggle:focus-visible,
-.tray-overflow-popup button:focus-visible {
+.tray-overflow-popup button:focus-visible,
+.dock-search-popup button:focus-visible {
 	outline: 2px solid var(--bloom-accent, #5b9bff);
 	outline-offset: 2px;
 }
 
-/* Windows notification overflow: an independent popover, not a second taskbar. */
+/* Shared Bloom Glassmorphism Popover Surface (Search, Tray Overflow, Add App) */
+.dock-search-popup,
 .tray-overflow-popup {
 	pointer-events: auto;
-	width: min(340px, 94vw);
-	max-height: min(425px, 75vh);
 	overflow: hidden;
 	display: flex;
 	flex-direction: column;
 	color: var(--bloom-text, white);
-	background: var(--bloom-bg-expanded, rgba(27, 29, 34, 0.96));
-	backdrop-filter: blur(38px) saturate(1.5);
-	-webkit-backdrop-filter: blur(38px) saturate(1.5);
-	border: 1px solid var(--bloom-border, rgba(255, 255, 255, 0.12));
-	border-radius: 18px;
-	box-shadow: 0 15px 40px rgba(0, 0, 0, 0.38);
+	background: var(--bloom-bg-expanded, rgba(24, 26, 32, 0.94));
+	backdrop-filter: blur(40px) saturate(1.65);
+	-webkit-backdrop-filter: blur(40px) saturate(1.65);
+	border: 1px solid color-mix(in srgb, var(--bloom-accent, #5b9bff) 22%, var(--bloom-border, rgba(255, 255, 255, 0.14)));
+	border-radius: 16px;
+	box-shadow:
+		0 -14px 44px rgba(0, 0, 0, 0.45),
+		inset 0 1px 0 rgba(255, 255, 255, 0.14);
+	transform-origin: bottom center;
+	font-family: inherit;
+}
+
+.dock-search-popup {
+	width: min(380px, 94vw);
+	max-height: min(440px, 75vh);
+}
+
+.dock-search-header {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin: 10px 10px 6px;
+	padding: 10px 12px;
+	border-radius: 12px;
+	background: color-mix(in srgb, var(--bloom-text, white) 8%, transparent);
+	border: 1px solid color-mix(in srgb, var(--bloom-accent, #5b9bff) 35%, color-mix(in srgb, var(--bloom-text, white) 12%, transparent));
+	box-shadow:
+		inset 0 1px 0 rgba(255, 255, 255, 0.08),
+		0 0 16px color-mix(in srgb, var(--bloom-accent, #5b9bff) 14%, transparent);
+}
+
+.dock-search-header-icon {
+	color: var(--bloom-accent, #5b9bff);
+	flex-shrink: 0;
+}
+
+.dock-search-input {
+	flex: 1;
+	background: none;
+	border: none;
+	outline: none;
+	color: var(--bloom-text, white);
+	font-size: 13.5px;
+	font-weight: 450;
+	font-family: inherit;
+	letter-spacing: -0.01em;
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+.dock-search-input::placeholder {
+	color: var(--bloom-text-muted, rgba(255, 255, 255, 0.42));
+}
+
+.dock-search-kbd {
+	font-size: 10px;
+	font-weight: 600;
+	padding: 2px 6px;
+	border-radius: 5px;
+	background: color-mix(in srgb, var(--bloom-text, white) 12%, transparent);
+	color: var(--bloom-text-muted, rgba(255, 255, 255, 0.65));
+	border: 1px solid color-mix(in srgb, var(--bloom-text, white) 14%, transparent);
+}
+
+.dock-search-results {
+	max-height: 290px;
+}
+
+.dock-search-badge {
+	font-size: 10px;
+	font-weight: 600;
+	padding: 2px 7px;
+	border-radius: 999px;
+	background: color-mix(in srgb, var(--bloom-accent, #5b9bff) 22%, transparent);
+	color: var(--bloom-accent, #5b9bff);
+	border: 1px solid color-mix(in srgb, var(--bloom-accent, #5b9bff) 40%, transparent);
+}
+
+.dock-search-open-hint {
+	font-size: 13px;
+	opacity: 0.45;
+	padding: 0 4px;
+	transition: opacity 150ms ease, transform 150ms ease;
+}
+
+.popup-app-row:hover .dock-search-open-hint,
+.popup-app-row.selected .dock-search-open-hint {
+	opacity: 0.95;
+	transform: translateX(2px);
+}
+
+.dock-search-footer {
+	padding: 8px 10px 10px;
+	border-top: 1px solid var(--bloom-border, rgba(255, 255, 255, 0.1));
+	display: flex;
+	justify-content: stretch;
+}
+
+.dock-search-win-btn {
+	width: 100%;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	padding: 8px 12px;
+	border-radius: 10px;
+	border: 1px solid color-mix(in srgb, var(--bloom-accent, #5b9bff) 32%, color-mix(in srgb, var(--bloom-text, white) 14%, transparent));
+	background: color-mix(in srgb, var(--bloom-accent, #5b9bff) 14%, color-mix(in srgb, var(--bloom-text, white) 6%, transparent));
+	color: var(--bloom-text, white);
+	font: inherit;
+	font-size: 12px;
+	font-weight: 550;
+	cursor: pointer;
+	transition: background 150ms ease, border-color 150ms ease, transform 150ms ease;
+}
+
+.dock-search-win-btn:hover {
+	background: color-mix(in srgb, var(--bloom-accent, #5b9bff) 26%, color-mix(in srgb, var(--bloom-text, white) 10%, transparent));
+	border-color: color-mix(in srgb, var(--bloom-accent, #5b9bff) 55%, transparent);
+}
+
+/* Windows notification overflow: an independent popover matching Bloom's glass theme. */
+.tray-overflow-popup {
+	width: min(340px, 94vw);
+	max-height: min(425px, 75vh);
 }
 .tray-overflow-header {
 	display: flex;
@@ -1127,14 +1286,43 @@ body {
 	gap: 10px;
 }
 .tray-overflow-footer button {
-	border: 0;
-	background: color-mix(in srgb, var(--bloom-text, white) 10%, transparent);
+	border: 1px solid color-mix(in srgb, var(--bloom-accent, #5b9bff) 30%, transparent);
+	background: color-mix(in srgb, var(--bloom-accent, #5b9bff) 14%, color-mix(in srgb, var(--bloom-text, white) 8%, transparent));
 	border-radius: 9px;
 	color: inherit;
-	padding: 7px 9px;
+	padding: 7px 10px;
 	white-space: nowrap;
 	font: inherit;
 	font-size: 11px;
+	font-weight: 550;
 	cursor: pointer;
+	transition: background 150ms ease, border-color 150ms ease;
+}
+.tray-overflow-footer button:hover {
+	background: color-mix(in srgb, var(--bloom-accent, #5b9bff) 24%, color-mix(in srgb, var(--bloom-text, white) 12%, transparent));
 }
 .tray-overflow-footer span { font-size: 10px; opacity: 0.65; line-height: 1.35; }
+
+/* Elastic detach transition bubble for native OS surfaces (Start Menu, Native Tray Overflow, Folders) */
+.dock-detach-bubble {
+	position: fixed;
+	bottom: 10px;
+	transform: translateX(-50%);
+	width: 128px;
+	height: 76px;
+	pointer-events: none;
+	z-index: 1;
+	border-radius: 20px;
+	background: radial-gradient(
+		ellipse at bottom center,
+		color-mix(in srgb, var(--bloom-accent, #5b9bff) 34%, var(--bloom-bg-expanded, rgba(28, 30, 38, 0.92))) 0%,
+		var(--bloom-bg-expanded, rgba(28, 30, 38, 0.86)) 70%
+	);
+	backdrop-filter: blur(28px) saturate(1.6);
+	-webkit-backdrop-filter: blur(28px) saturate(1.6);
+	border: 1px solid color-mix(in srgb, var(--bloom-accent, #5b9bff) 45%, rgba(255, 255, 255, 0.18));
+	box-shadow:
+		0 -12px 32px rgba(0, 0, 0, 0.35),
+		inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+

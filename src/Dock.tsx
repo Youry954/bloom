@@ -11,7 +11,14 @@ import { reloadIfMirrorWasStale } from "./hooks/settingsMirror";
 
 import { mergeTrayApps, selectDockTrayApps, type AppInfo, type TrayApp } from "./dockApps";
 import { driveLetter, hideDrive, removeCustomFolder, type DockExtra } from "./dockExtras";
-import { createRegionSender, measureElements, padRect, type RegionRect } from "./windowRegion";
+import {
+	computeDockBarRect,
+	createRegionSender,
+	measureDockPopups,
+	measureElements,
+	type RegionRect,
+	untransformedPopupBox
+} from "./dockRegion";
 
 // Host processes (Edge/Chrome/Brave/ApplicationFrameHost) run every PWA/UWP
 // window, so their window title must be part of their identity — otherwise two
@@ -151,6 +158,36 @@ const ITEM_INITIAL = { opacity: 0, scale: 0 };
 const ITEM_ANIMATE = { opacity: 1, scale: 1 };
 const ITEM_EXIT = { opacity: 0, scale: 0 };
 
+// Elastic "Detach / Stretch" physics for all Dock popups, menus, and previews.
+const DETACH_INITIAL = {
+	scaleX: 0.3,
+	scaleY: 0.1,
+	y: 24,
+	opacity: 0,
+	borderRadius: "32px"
+};
+const DETACH_ANIMATE = {
+	scaleX: 1,
+	scaleY: 1,
+	y: 0,
+	opacity: 1,
+	borderRadius: "16px"
+};
+const DETACH_EXIT = {
+	scaleX: 0.35,
+	scaleY: 0.12,
+	y: 20,
+	opacity: 0,
+	borderRadius: "28px",
+	transition: { duration: 0.14, ease: "easeIn" as const }
+};
+const DETACH_SPRING = {
+	type: "spring" as const,
+	stiffness: 380,
+	damping: 22,
+	mass: 0.8
+};
+
 // One dot per open window, capped at three.
 function WindowDots({ count, background }: { count: number; background?: boolean }) {
 	return (
@@ -213,12 +250,20 @@ const Dock = memo(function Dock() {
 	const [isOverlapped, setIsOverlapped] = useState(false);
 	const [isVisible, setIsVisible] = useState(true);
 	const [showAddPopup, setShowAddPopup] = useState(false);
+	const [showSearchPopup, setShowSearchPopup] = useState(false);
 	const [showTrayPopup, setShowTrayPopup] = useState(false);
 	const [trayItems, setTrayItems] = useState<TrayApp[]>([]);
 	const [trayIcons, setTrayIcons] = useState<Record<string, string>>({});
 	const [trayLoading, setTrayLoading] = useState(false);
 	const trayOpeningRef = useRef(false);
 	const [nativeMenuOpen, setNativeMenuOpen] = useState(false);
+	const [detachingId, setDetachingId] = useState<string | null>(null);
+	const detachTimerRef = useRef<any>(null);
+	const [detachBubble, setDetachBubble] = useState<{
+		key: number;
+		x: number;
+		width: number;
+	} | null>(null);
 	const [contextMenu, setContextMenu] = useState<{
 		x: number;
 		y: number;
@@ -255,21 +300,20 @@ const Dock = memo(function Dock() {
 		return () => window.removeEventListener("resize", onResize);
 	}, []);
 
-	// Measure the dock pill when the popup opens; the card tucks ~14px
-	// behind the pill (which paints above it), so the seam stays fused even
-	// if the measurement is off by a few px at some scale.
+	// Measure the dock pill when a popup opens; the card sits right above the pill.
 	useEffect(() => {
-		if (showAddPopup) {
+		if (showAddPopup || showSearchPopup || showTrayPopup) {
 			const h = dockRef.current?.getBoundingClientRect().height ?? 0;
-			if (h > 0) setPopupBottom(h / (scale || 1) - 14);
+			if (h > 0) setPopupBottom(h / (scale || 1) - 10);
 		}
-	}, [showAddPopup, scale]);
+	}, [showAddPopup, showSearchPopup, showTrayPopup, scale]);
 
 	// The dock normally uses a non-activating window, which is ideal for icons
-	// but prevents native keyboard input in the Add App search. Temporarily
-	// enable real focus while the popup exists and restore it on unmount.
+	// but prevents native keyboard input in the Add App or Bloom Search popup.
+	// Temporarily enable real focus while a search popup exists and restore it on unmount.
 	useEffect(() => {
-		if (!showAddPopup) return;
+		const needsFocus = showAddPopup || showSearchPopup;
+		if (!needsFocus) return;
 		let mounted = true;
 		invoke("set_dock_popup_focus", { active: true })
 			.then(() => {
@@ -277,16 +321,22 @@ const Dock = memo(function Dock() {
 					document.querySelector<HTMLInputElement>(".popup-search-input")?.focus();
 				}
 			})
-			.catch((error) => console.error("Could not focus Add App search:", error));
+			.catch((error) => console.error("Could not focus dock search popup:", error));
 		return () => {
 			mounted = false;
 			invoke("set_dock_popup_focus", { active: false }).catch(() => {});
 		};
-	}, [showAddPopup]);
+	}, [showAddPopup, showSearchPopup]);
 
 	const isCurrentlyHovered = isDockHovered || isEdgeHovered;
 	const [interactionState, setInteractionState] = useState<"active" | "grace" | "none">("none");
-	const isAnyInteraction = isCurrentlyHovered || !!contextMenu || showAddPopup || showTrayPopup || nativeMenuOpen;
+	const isAnyInteraction =
+		isCurrentlyHovered ||
+		!!contextMenu ||
+		showAddPopup ||
+		showSearchPopup ||
+		showTrayPopup ||
+		nativeMenuOpen;
 
 	const previewTimerRef = useRef<any>(null);
 	const isPreviewHoveredRef = useRef(false);
@@ -307,9 +357,16 @@ const Dock = memo(function Dock() {
 		((dockMode === "smart" && isOverlapped && interactionState === "none") ||
 			(dockMode === "peek" && interactionState === "none"));
 
+	// Dynamic horizontal expansion ("expanded/docked" state) when a window is
+	// maximized or active over the work area above the 4px gap.
+	const isDockedExpanded =
+		(isMaximized || (dockMode === "fixed" && isOverlapped)) &&
+		isExpanded &&
+		!isHidden &&
+		isVisible;
+
 	// Adaptive mode (fixed dock only): stretch into a full-width taskbar while a
-	// standard maximized window is in the foreground, so the reserved strip no
-	// longer looks like a cut-out around the centered pill.
+	// standard maximized window is in the foreground.
 	const isAdaptive =
 		dockAdaptive && dockMode === "fixed" && isMaximized && isExpanded && !isHidden && isVisible;
 	// Nearly full width — 24px margin per side at the visual (scaled) size.
@@ -380,11 +437,23 @@ const Dock = memo(function Dock() {
 		const observer = new ResizeObserver(updateRect);
 		if (dockRef.current) observer.observe(dockRef.current);
 
+		// Track Framer Motion horizontal spring expansion frame-by-frame so DOCK_RECT stays exact.
+		let rafId = 0;
+		const start = performance.now();
+		const tick = (now: number) => {
+			updateRect();
+			if (now - start < 460) {
+				rafId = requestAnimationFrame(tick);
+			}
+		};
+		rafId = requestAnimationFrame(tick);
+
 		return () => {
+			cancelAnimationFrame(rafId);
 			window.removeEventListener("resize", updateRect);
 			observer.disconnect();
 		};
-	}, [pinnedApps, activeApps, isHidden, previewData, scale]);
+	}, [pinnedApps, activeApps, isHidden, isExpanded, isDockedExpanded, isAdaptive, previewData, scale]);
 
 	useEffect(() => {
 		const init = async () => {
@@ -759,7 +828,25 @@ const Dock = memo(function Dock() {
 
 	const menuRef = useRef<HTMLDivElement>(null);
 	const popupRef = useRef<HTMLDivElement>(null);
+	const searchPopupRef = useRef<HTMLDivElement>(null);
 	const trayPopupRef = useRef<HTMLDivElement>(null);
+
+	const triggerDetachEffect = (id: string, element?: HTMLElement | null, withBubble = false) => {
+		if (detachTimerRef.current) clearTimeout(detachTimerRef.current);
+		setDetachingId(id);
+		detachTimerRef.current = setTimeout(() => setDetachingId(null), 320);
+
+		if (withBubble && element) {
+			const r = element.getBoundingClientRect();
+			const centerX = r.left + r.width / 2;
+			const bubbleW = Math.max(136, r.width * 3.2);
+			const key = Date.now();
+			setDetachBubble({ key, x: centerX, width: bubbleW });
+			setTimeout(() => {
+				setDetachBubble((prev) => (prev?.key === key ? null : prev));
+			}, 260);
+		}
+	};
 
 	const showActionError = (error: unknown) => {
 		if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -783,16 +870,19 @@ const Dock = memo(function Dock() {
 	const handleContextMenu = (e: React.MouseEvent, app: AppInfo | null) => {
 		e.stopPropagation();
 		e.preventDefault();
+		if (app) triggerDetachEffect(itemKey(app), e.currentTarget as HTMLElement, false);
 		setContextMenu({ x: e.clientX, y: e.clientY, app });
 	};
 
-	const handleExtraClick = (extra: DockExtra) => {
+	const handleExtraClick = (extra: DockExtra, element?: HTMLElement | null) => {
+		triggerDetachEffect(extra.id, element, true);
 		invoke("open_dock_extra", { kind: extra.kind, path: extra.path }).catch(showActionError);
 	};
 
 	const handleExtraContextMenu = (e: React.MouseEvent, extra: DockExtra) => {
 		e.stopPropagation();
 		e.preventDefault();
+		triggerDetachEffect(extra.id, e.currentTarget as HTMLElement, false);
 		setContextMenu({ x: e.clientX, y: e.clientY, app: null, extra });
 	};
 
@@ -826,7 +916,8 @@ const Dock = memo(function Dock() {
 		closeMenu();
 	};
 
-	const openTaskView = () => {
+	const openTaskView = (element?: HTMLElement | null) => {
+		triggerDetachEffect("task-view", element, true);
 		invoke("open_system_action", { action: "task-view" }).catch(showActionError);
 	};
 
@@ -850,10 +941,13 @@ const Dock = memo(function Dock() {
 			return;
 		}
 		const margin = 8;
-		const r = menuRef.current.getBoundingClientRect();
+		const el = menuRef.current;
+		const r = el.getBoundingClientRect();
+		const fullW = Math.max(r.width, (el.offsetWidth || 180) * scale);
+		const fullH = Math.max(r.height, (el.offsetHeight || 160) * scale);
 		setMenuPos({
-			left: Math.max(margin, Math.min(contextMenu.x, window.innerWidth - r.width - margin)),
-			top: Math.max(margin, contextMenu.y - r.height - margin)
+			left: Math.max(margin, Math.min(contextMenu.x, window.innerWidth - fullW - margin)),
+			top: Math.max(margin, contextMenu.y - fullH - margin)
 		});
 	}, [contextMenu, scale]);
 
@@ -865,8 +959,22 @@ const Dock = memo(function Dock() {
 
 	const closePopup = () => {
 		setShowAddPopup(false);
+		setShowSearchPopup(false);
 		setShowTrayPopup(false);
 		invoke("set_menu_open", { open: false, rect: null }).catch(() => {});
+	};
+
+	const toggleSearchPopup = (element?: HTMLElement | null) => {
+		triggerDetachEffect("dock-search", element, false);
+		if (showSearchPopup) {
+			closePopup();
+			return;
+		}
+		setShowAddPopup(false);
+		setShowTrayPopup(false);
+		closeMenu();
+		setPreviewData(null);
+		setShowSearchPopup(true);
 	};
 
 	// Show live Windows notification icons in a compact, reversible overflow
@@ -910,7 +1018,7 @@ const Dock = memo(function Dock() {
 		};
 	}, [showTrayPopup]);
 
-	const toggleTrayPopup = async () => {
+	const toggleTrayPopup = async (element?: HTMLElement | null) => {
 		if (trayOpeningRef.current || nativeMenuOpen) return;
 		if (showTrayPopup) {
 			closePopup();
@@ -918,13 +1026,16 @@ const Dock = memo(function Dock() {
 		}
 		trayOpeningRef.current = true;
 		setShowAddPopup(false);
+		setShowSearchPopup(false);
 		closeMenu();
 		setPreviewData(null);
 		try {
 			if (await invoke<boolean>("uses_legacy_tray_overflow")) {
+				triggerDetachEffect("dock-tray", element, true);
 				setNativeMenuOpen(true);
 				await invoke("show_legacy_tray_overflow");
 			} else {
+				triggerDetachEffect("dock-tray", element, false);
 				setShowTrayPopup(true);
 			}
 		} catch (error) {
@@ -935,14 +1046,15 @@ const Dock = memo(function Dock() {
 		}
 	};
 
-	// A press outside the dock while a menu or the Add App popup is open. The
-	// click itself goes to whatever is under it (the window region keeps the
-	// dock out of the way), so the backend's mouse hook reports it instead.
+	// A press outside the dock while a menu or popup is open. The click itself
+	// goes to whatever is under it (the window region keeps the dock out of the
+	// way), so the backend's mouse hook reports it instead.
 	useEffect(() => {
 		const unlisten = listen("dock-dismiss-menu", () => {
 			setContextMenu(null);
 			setActiveSubmenu(null);
 			setShowAddPopup(false);
+			setShowSearchPopup(false);
 			setShowTrayPopup(false);
 		});
 		return () => {
@@ -960,22 +1072,40 @@ const Dock = memo(function Dock() {
 		[]
 	);
 
-	// Clip the dock window to what it draws (see window_region.rs). The bar
-	// gets a full-width band along the bottom, as tall as the expanded bar plus
-	// room for the icons' lift and tooltips above it, so its reveal and width
-	// animations are never clipped; the click-through switching still keeps
-	// the band clear unless the cursor is at the dock. The floating parts are
-	// measured, padded for their shadows. While an icon is dragged the whole
-	// window is included so the dragged icon isn't clipped.
-	useEffect(() => {
+	// Synchronize SetWindowRgn with the Dock's dynamic horizontal expansion and
+	// all elastic popups (including untransformed bounds during spring animations).
+	const computeAndSendDockRegion = () => {
 		const bar = dockRef.current?.getBoundingClientRect();
 		if (bar && isExpanded && !isHidden && isVisible) {
 			dockBandHeightRef.current = Math.max(dockBandHeightRef.current, bar.height);
 		}
-		const band = (dockBandHeightRef.current || 72 * scale) + 64 * scale;
-		const wanted: RegionRect[] = [
-			{ x: 0, y: window.innerHeight - band, width: window.innerWidth, height: band }
-		];
+		const liftRoom = 56 * scale;
+		const wanted: RegionRect[] = [];
+
+		if (bar && isExpanded && !isHidden && isVisible && !startupAnimating) {
+			wanted.push(
+				...computeDockBarRect({
+					windowWidth: window.innerWidth,
+					windowHeight: window.innerHeight,
+					dockRect: {
+						x: bar.left,
+						y: bar.top - liftRoom,
+						width: bar.width,
+						height: bar.height + liftRoom
+					},
+					isVisible,
+					isExpanded,
+					isHidden,
+					isDockedExpanded,
+					adaptiveWidth: isAdaptive,
+					dockPad: isDockedExpanded ? 20 : 16
+				})
+			);
+		} else {
+			const band = (dockBandHeightRef.current || 72 * scale) + 64 * scale;
+			wanted.push({ x: 0, y: window.innerHeight - band, width: window.innerWidth, height: band });
+		}
+
 		if (isDragging) {
 			wanted.push({ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight });
 		}
@@ -984,71 +1114,134 @@ const Dock = memo(function Dock() {
 				[".preview-tooltip", 40],
 				[".context-menu", 34],
 				[".submenu", 34],
-				[".dock-toast", 20]
-			])
+				[".dock-toast", 20],
+				[".dock-detach-bubble", 24]
+			]),
+			...measureDockPopups(undefined, scale)
 		);
-		// The Add App popup grows from scaleY 0, and that animation doesn't
-		// re-render the dock, so its own box would be measured collapsed. Its
-		// anchor isn't transformed and is exactly as tall as the open popup, so
-		// the height comes from there and the width from the popup itself.
-		const popup = popupRef.current;
-		const anchor = popup?.parentElement;
-		if (popup && anchor) {
-			const p = popup.getBoundingClientRect();
+
+		const addPanelRect = (panel: HTMLDivElement | null) => {
+			const anchor = panel?.parentElement;
+			if (!panel || !anchor) return;
+			const p = panel.getBoundingClientRect();
 			const a = anchor.getBoundingClientRect();
-			wanted.push(padRect({ x: p.left, y: a.top, width: p.width, height: a.height }, 40));
-		}
-		const trayPanel = trayPopupRef.current;
-		const trayAnchor = trayPanel?.parentElement;
-		if (trayPanel && trayAnchor) {
-			const p = trayPanel.getBoundingClientRect();
-			const a = trayAnchor.getBoundingClientRect();
-			wanted.push(padRect({ x: p.left, y: a.top, width: p.width, height: a.height }, 40));
-		}
+			const fullW = Math.max(p.width, (panel.offsetWidth || 380) * scale);
+			const fullH = Math.max(a.height, (panel.offsetHeight || 340) * scale);
+			wanted.push(
+				untransformedPopupBox(
+					{ x: p.left, y: a.top, width: p.width, height: a.height },
+					fullW,
+					fullH,
+					40
+				)
+			);
+		};
+		addPanelRect(popupRef.current);
+		addPanelRect(searchPopupRef.current);
+		addPanelRect(trayPopupRef.current);
+
 		sendDockRegion(wanted);
+	};
+
+	useEffect(() => {
+		computeAndSendDockRegion();
 	});
+
+	// Real-time SetWindowRgn tracking during horizontal expansion and elastic popup animations.
+	useEffect(() => {
+		let rafId = 0;
+		const start = performance.now();
+		const step = (now: number) => {
+			computeAndSendDockRegion();
+			if (now - start < 460) {
+				rafId = requestAnimationFrame(step);
+			}
+		};
+		rafId = requestAnimationFrame(step);
+		return () => cancelAnimationFrame(rafId);
+	}, [
+		isDockedExpanded,
+		isAdaptive,
+		isExpanded,
+		isHidden,
+		showSearchPopup,
+		showTrayPopup,
+		showAddPopup,
+		contextMenu,
+		detachBubble,
+		scale
+	]);
 
 	useEffect(() => {
 		let open = false;
 		let rect = null;
 
-		if (contextMenu && menuRef.current) {
-			const r = menuRef.current.getBoundingClientRect();
-			rect = {
-				x: Math.round(r.x),
-				y: Math.round(r.y),
-				width: Math.round(r.width + (activeSubmenu ? 160 : 0)),
-				height: Math.round(r.height)
+		const fullPopupRect = (panel: HTMLDivElement) => {
+			const r = panel.getBoundingClientRect();
+			const anchor = panel.parentElement?.getBoundingClientRect();
+			const fullW = Math.max(r.width, (panel.offsetWidth || 380) * scale);
+			const fullH = Math.max(anchor?.height ?? r.height, (panel.offsetHeight || 320) * scale);
+			const box = untransformedPopupBox(
+				{
+					x: r.left,
+					y: anchor?.top ?? r.top,
+					width: r.width,
+					height: anchor?.height ?? r.height
+				},
+				fullW,
+				fullH,
+				12
+			);
+			return {
+				x: Math.round(box.x),
+				y: Math.round(box.y),
+				width: Math.round(box.width),
+				height: Math.round(box.height)
 			};
+		};
+
+		if (contextMenu && menuRef.current) {
+			const el = menuRef.current;
+			const r = el.getBoundingClientRect();
+			const fullW = Math.max(r.width, (el.offsetWidth || 180) * scale);
+			const fullH = Math.max(r.height, (el.offsetHeight || 160) * scale);
+			const box = untransformedPopupBox(
+				{ x: r.left, y: r.top, width: r.width, height: r.height },
+				fullW + (activeSubmenu ? 160 : 0),
+				fullH,
+				10
+			);
+			rect = {
+				x: Math.round(box.x),
+				y: Math.round(box.y),
+				width: Math.round(box.width),
+				height: Math.round(box.height)
+			};
+			open = true;
+		} else if (showSearchPopup && searchPopupRef.current) {
+			rect = fullPopupRect(searchPopupRef.current);
 			open = true;
 		} else if (showTrayPopup && trayPopupRef.current) {
-			const r = trayPopupRef.current.getBoundingClientRect();
-			const anchor = trayPopupRef.current.parentElement?.getBoundingClientRect();
-			rect = {
-				x: Math.round(r.x),
-				y: Math.round(anchor?.top ?? r.y),
-				width: Math.round(r.width),
-				height: Math.round(anchor?.height ?? r.height)
-			};
+			rect = fullPopupRect(trayPopupRef.current);
 			open = true;
 		} else if (showAddPopup && popupRef.current) {
-			const r = popupRef.current.getBoundingClientRect();
-			const anchor = popupRef.current.parentElement?.getBoundingClientRect();
-			// The popup animates from scaleY(0), so its transformed height is
-			// briefly tiny. Use the full untransformed anchor for hit testing:
-			// otherwise the first click in search is seen as "outside" and
-			// dismisses the popup through the native mouse hook.
-			rect = {
-				x: Math.round(r.x),
-				y: Math.round(anchor?.top ?? r.top),
-				width: Math.round(r.width),
-				height: Math.round(anchor?.height ?? r.height)
-			};
+			rect = fullPopupRect(popupRef.current);
 			open = true;
 		}
 
 		invoke("set_menu_open", { open, rect }).catch(() => {});
-	}, [contextMenu, menuPos, showAddPopup, showTrayPopup, trayItems, pinnedApps, activeApps, activeSubmenu, scale]);
+	}, [
+		contextMenu,
+		menuPos,
+		showAddPopup,
+		showSearchPopup,
+		showTrayPopup,
+		trayItems,
+		pinnedApps,
+		activeApps,
+		activeSubmenu,
+		scale
+	]);
 
 	const dockItems = useMemo(() => {
 		const runningMap = new Map();
@@ -1281,10 +1474,29 @@ const Dock = memo(function Dock() {
 	}, [hoveredApp, isDragging, dockItems]);
 
 	const iconVariants = {
-		idle: { y: 0, scale: 1 },
-		hover: { y: -5, scale: 1.1 },
-		drag: { y: -10, scale: 1.1, opacity: 0.8 },
-		tap: { scale: 0.95 }
+		idle: { y: 0, scaleX: 1, scaleY: 1, scale: 1 },
+		hover: {
+			y: -5,
+			scaleX: 1.06,
+			scaleY: 1.1,
+			scale: 1,
+			transition: { type: "spring" as const, stiffness: 420, damping: 20 }
+		},
+		drag: { y: -10, scaleX: 1.08, scaleY: 1.08, scale: 1.1, opacity: 0.8 },
+		tap: {
+			y: 2,
+			scaleX: 1.18,
+			scaleY: 0.82,
+			scale: 0.96,
+			transition: { type: "spring" as const, stiffness: 520, damping: 18 }
+		},
+		detach: {
+			y: -7,
+			scaleX: 0.88,
+			scaleY: 1.22,
+			scale: 1,
+			transition: { type: "spring" as const, stiffness: 380, damping: 16, mass: 0.7 }
+		}
 	};
 
 	const renderExtra = (extra: DockExtra) => (
@@ -1306,14 +1518,22 @@ const Dock = memo(function Dock() {
 			}}
 			onClick={(e) => {
 				e.stopPropagation();
-				handleExtraClick(extra);
+				handleExtraClick(extra, e.currentTarget as HTMLElement);
 			}}
 		>
 			{hoveredApp === extra.id && <div className="tooltip">{extra.name}</div>}
 			<motion.div
 				className="dock-icon"
 				variants={iconVariants}
-				animate={pressedApp === extra.id ? "tap" : hoveredApp === extra.id ? "hover" : "idle"}
+				animate={
+					detachingId === extra.id
+						? "detach"
+						: pressedApp === extra.id
+							? "tap"
+							: hoveredApp === extra.id
+								? "hover"
+								: "idle"
+				}
 				onPointerDown={() => setPressedApp(extra.id)}
 				onPointerUp={() => setPressedApp(null)}
 				onPointerCancel={() => setPressedApp(null)}
@@ -1341,7 +1561,7 @@ const Dock = memo(function Dock() {
 				<motion.div
 					ref={dockRef}
 					layout
-					className={`dock ${isExpanded && !isHidden ? "dock-expanded" : ""} ${isImpacted && !isExpanded && !isHidden ? "dock-impacted" : ""} ${dockIconOnly ? "dock-icon-only" : ""} ${isAdaptive ? "dock-adaptive" : ""}`}
+					className={`dock ${isExpanded && !isHidden ? "dock-expanded" : ""} ${isImpacted && !isExpanded && !isHidden ? "dock-impacted" : ""} ${dockIconOnly ? "dock-icon-only" : ""} ${isDockedExpanded ? "dock-maximized-expanded" : ""} ${isAdaptive ? "dock-adaptive" : ""}`}
 					onMouseEnter={() => setIsDockHovered(true)}
 					onMouseLeave={() => {
 						setIsDockHovered(false);
@@ -1353,6 +1573,8 @@ const Dock = memo(function Dock() {
 						opacity: 1,
 						width: 34,
 						height: 34,
+						paddingLeft: 0,
+						paddingRight: 0,
 						borderTopLeftRadius: 17,
 						borderTopRightRadius: 17,
 						borderBottomLeftRadius: 17,
@@ -1363,6 +1585,10 @@ const Dock = memo(function Dock() {
 						width:
 							isExpanded && !isHidden && isVisible ? (isAdaptive ? adaptiveWidth : "auto") : 34,
 						height: isExpanded && !isHidden && isVisible ? "auto" : 34,
+						paddingLeft:
+							isExpanded && !isHidden && isVisible ? (isDockedExpanded && !isAdaptive ? 32 : 14) : 0,
+						paddingRight:
+							isExpanded && !isHidden && isVisible ? (isDockedExpanded && !isAdaptive ? 32 : 14) : 0,
 						borderTopLeftRadius: (isImpacted || isExpanded) && !isHidden && isVisible ? 18 : 17,
 						borderTopRightRadius: (isImpacted || isExpanded) && !isHidden && isVisible ? 18 : 17,
 						borderBottomLeftRadius: (isImpacted || isExpanded) && !isHidden && isVisible ? 0 : 17,
@@ -1374,6 +1600,8 @@ const Dock = memo(function Dock() {
 						y: { type: "spring", stiffness: 400, damping: 35, mass: 0.8 },
 						width: { type: "spring", stiffness: 250, damping: 22, mass: 0.8 },
 						height: { type: "spring", stiffness: 250, damping: 22, mass: 0.8 },
+						paddingLeft: { type: "spring", stiffness: 320, damping: 24, mass: 0.85 },
+						paddingRight: { type: "spring", stiffness: 320, damping: 24, mass: 0.85 },
 						layout: isDragging ? { duration: 0 } : { type: "spring", stiffness: 300, damping: 25 },
 						borderTopLeftRadius: { type: "spring", stiffness: 500, damping: 30 },
 						borderTopRightRadius: { type: "spring", stiffness: 500, damping: 30 },
@@ -1404,7 +1632,7 @@ const Dock = memo(function Dock() {
 											opacity: { duration: 0.15, delay: 0.15 },
 											scale: { type: "spring", stiffness: 400, damping: 25, delay: 0.15 }
 										}}
-										className="dock-icon-wrapper"
+										className="dock-icon-wrapper dock-system-wrapper"
 										onContextMenu={(e) => handleContextMenu(e, startItem)}
 										onMouseEnter={() => setHoveredApp(itemKey(startItem))}
 										onMouseLeave={() => {
@@ -1417,20 +1645,23 @@ const Dock = memo(function Dock() {
 											<div className="tooltip">{startItem.name}</div>
 										)}
 										<motion.div
-											className="dock-icon"
+											className="dock-icon dock-start-btn"
 											variants={iconVariants}
 											animate={
-												pressedApp === itemKey(startItem)
-													? "tap"
-													: hoveredApp === itemKey(startItem)
-														? "hover"
-														: "idle"
+												detachingId === itemKey(startItem)
+													? "detach"
+													: pressedApp === itemKey(startItem)
+														? "tap"
+														: hoveredApp === itemKey(startItem)
+															? "hover"
+															: "idle"
 											}
 											onPointerDown={() => setPressedApp(itemKey(startItem))}
 											onPointerUp={() => setPressedApp(null)}
 											onPointerCancel={() => setPressedApp(null)}
 											onClick={(e) => {
 												e.stopPropagation();
+												triggerDetachEffect(itemKey(startItem), e.currentTarget as HTMLElement, true);
 												handleAppClick(startItem);
 											}}
 										>
@@ -1447,32 +1678,68 @@ const Dock = memo(function Dock() {
 									</motion.div>
 								)}
 
-								{/* Native Windows Search, styled like a compact Windows 11 pill. */}
+								{/* Integrated 100% Bloom-themed Search pill & launcher. */}
 								<motion.button
 									type="button"
-									className="dock-search-pill"
-									title="Rechercher sur Windows"
-									aria-label="Rechercher sur Windows"
+									className={`dock-search-pill${showSearchPopup ? " is-open" : ""}`}
+									title="Rechercher dans Bloom et sur Windows"
+									aria-label="Rechercher dans Bloom et sur Windows"
+									aria-expanded={showSearchPopup}
+									variants={iconVariants}
+									animate={
+										detachingId === "dock-search"
+											? "detach"
+											: pressedApp === "dock-search"
+												? "tap"
+												: hoveredApp === "dock-search"
+													? "hover"
+													: "idle"
+									}
+									onMouseEnter={() => setHoveredApp("dock-search")}
+									onMouseLeave={() => {
+										setHoveredApp(null);
+										setPressedApp(null);
+									}}
+									onPointerDown={() => setPressedApp("dock-search")}
+									onPointerUp={() => setPressedApp(null)}
+									onPointerCancel={() => setPressedApp(null)}
 									onClick={(e) => {
 										e.stopPropagation();
-										closePopup();
-										invoke("open_system_action", { action: "search" }).catch(showActionError);
+										toggleSearchPopup(e.currentTarget);
 									}}
 								>
 									<Search size={15} aria-hidden="true" />
 									<span>Recherche</span>
 								</motion.button>
 
-								{/* Windows notification overflow, with native app menus. */}
+								{/* Windows notification overflow, harmonized with Start and Search. */}
 								<motion.button
 									type="button"
-									className={`dock-tray-toggle${showTrayPopup ? " is-open" : ""}`}
+									className={`dock-tray-toggle${showTrayPopup || nativeMenuOpen ? " is-open" : ""}`}
 									title="Applications en arrière-plan"
 									aria-label="Afficher les applications en arrière-plan"
 									aria-expanded={showTrayPopup || nativeMenuOpen}
+									variants={iconVariants}
+									animate={
+										detachingId === "dock-tray"
+											? "detach"
+											: pressedApp === "dock-tray"
+												? "tap"
+												: hoveredApp === "dock-tray"
+													? "hover"
+													: "idle"
+									}
+									onMouseEnter={() => setHoveredApp("dock-tray")}
+									onMouseLeave={() => {
+										setHoveredApp(null);
+										setPressedApp(null);
+									}}
+									onPointerDown={() => setPressedApp("dock-tray")}
+									onPointerUp={() => setPressedApp(null)}
+									onPointerCancel={() => setPressedApp(null)}
 									onClick={(e) => {
 										e.stopPropagation();
-										void toggleTrayPopup();
+										void toggleTrayPopup(e.currentTarget);
 									}}
 								>
 									<ChevronUp size={18} aria-hidden="true" />
@@ -1503,18 +1770,20 @@ const Dock = memo(function Dock() {
 											className="dock-icon"
 											variants={iconVariants}
 											animate={
-												pressedApp === "task-view"
-													? "tap"
-													: hoveredApp === "task-view"
-														? "hover"
-														: "idle"
+												detachingId === "task-view"
+													? "detach"
+													: pressedApp === "task-view"
+														? "tap"
+														: hoveredApp === "task-view"
+															? "hover"
+															: "idle"
 											}
 											onPointerDown={() => setPressedApp("task-view")}
 											onPointerUp={() => setPressedApp(null)}
 											onPointerCancel={() => setPressedApp(null)}
 											onClick={(e) => {
 												e.stopPropagation();
-												openTaskView();
+												openTaskView(e.currentTarget as HTMLElement);
 											}}
 										>
 											<TaskViewIcon />
@@ -1559,7 +1828,10 @@ const Dock = memo(function Dock() {
 											onAuxClick={(e) => handleMiddleClick(e, app)}
 											onClick={(e) => {
 												e.stopPropagation();
-												if (!isDragging) handleAppClick(app);
+												if (!isDragging) {
+													triggerDetachEffect(itemKey(app), e.currentTarget as HTMLElement, false);
+													handleAppClick(app);
+												}
 											}}
 										>
 											<motion.div
@@ -1582,11 +1854,12 @@ const Dock = memo(function Dock() {
 														previewData.id === itemKey(app) &&
 														hoveredApp === itemKey(app) && (
 															<motion.div
-																className={`preview-tooltip ${previewData.previews.length > 1 ? "multi" : ""}`}
-																initial={{ opacity: 0, y: 10, scale: 0.95 }}
-																animate={{ opacity: 1, y: 0, scale: 1 }}
-																exit={{ opacity: 0, scale: 0.95 }}
-																transition={{ duration: 0.15 }}
+																className={`preview-tooltip dock-tooltip-popup ${previewData.previews.length > 1 ? "multi" : ""}`}
+																style={{ transformOrigin: "bottom center" }}
+																initial={DETACH_INITIAL}
+																animate={DETACH_ANIMATE}
+																exit={DETACH_EXIT}
+																transition={DETACH_SPRING}
 																onMouseEnter={() => {
 																	isPreviewHoveredRef.current = true;
 																}}
@@ -1639,13 +1912,15 @@ const Dock = memo(function Dock() {
 													className="dock-icon"
 													variants={iconVariants}
 													animate={
-														pressedApp === itemKey(app)
-															? "tap"
-															: isDragging && !app.is_pinned
-																? "idle"
-																: hoveredApp === itemKey(app) && !isDragging
-																	? "hover"
-																	: "idle"
+														detachingId === itemKey(app)
+															? "detach"
+															: pressedApp === itemKey(app)
+																? "tap"
+																: isDragging && !app.is_pinned
+																	? "idle"
+																	: hoveredApp === itemKey(app) && !isDragging
+																		? "hover"
+																		: "idle"
 													}
 													whileDrag="drag"
 													onPointerDown={() => setPressedApp(itemKey(app))}
@@ -1739,6 +2014,7 @@ const Dock = memo(function Dock() {
 										onAuxClick={(e) => handleMiddleClick(e, app)}
 										onClick={(e) => {
 											e.stopPropagation();
+											triggerDetachEffect(itemKey(app), e.currentTarget as HTMLElement, false);
 											handleAppClick(app);
 										}}
 									>
@@ -1748,11 +2024,12 @@ const Dock = memo(function Dock() {
 												previewData.id === itemKey(app) &&
 												hoveredApp === itemKey(app) && (
 													<motion.div
-														className={`preview-tooltip ${previewData.previews.length > 1 ? "multi" : ""}`}
-														initial={{ opacity: 0, y: 10, scale: 0.95 }}
-														animate={{ opacity: 1, y: 0, scale: 1 }}
-														exit={{ opacity: 0, scale: 0.95 }}
-														transition={{ duration: 0.15 }}
+														className={`preview-tooltip dock-tooltip-popup ${previewData.previews.length > 1 ? "multi" : ""}`}
+														style={{ transformOrigin: "bottom center" }}
+														initial={DETACH_INITIAL}
+														animate={DETACH_ANIMATE}
+														exit={DETACH_EXIT}
+														transition={DETACH_SPRING}
 														onMouseEnter={() => {
 															isPreviewHoveredRef.current = true;
 														}}
@@ -1803,11 +2080,13 @@ const Dock = memo(function Dock() {
 											className="dock-icon"
 											variants={iconVariants}
 											animate={
-												pressedApp === itemKey(app)
-													? "tap"
-													: hoveredApp === itemKey(app) && !isDragging
-														? "hover"
-														: "idle"
+												detachingId === itemKey(app)
+													? "detach"
+													: pressedApp === itemKey(app)
+														? "tap"
+														: hoveredApp === itemKey(app) && !isDragging
+															? "hover"
+															: "idle"
 											}
 											onPointerDown={() => setPressedApp(itemKey(app))}
 											onPointerUp={() => setPressedApp(null)}
@@ -1873,304 +2152,343 @@ const Dock = memo(function Dock() {
 				</motion.div>
 			</div>
 
-			{contextMenu && (
-				<div
-					ref={menuRef}
-					className="context-menu"
-					style={{
-						left: (menuPos?.left ?? contextMenu.x) / scale,
-						top: (menuPos?.top ?? contextMenu.y) / scale,
-						visibility: menuPos ? "visible" : "hidden",
-						zoom: scale
-					}}
-					onClick={(e) => e.stopPropagation()}
-				>
-					{!contextMenu.extra &&
-						!contextMenu.taskView &&
-						(!contextMenu.app || contextMenu.app.path === "start") && (
-						<div
-							style={{
-								maxHeight: Math.max(64, window.innerHeight / scale - 200),
-								overflowY: "auto"
-							}}
-						>
-							{(contextMenu.app
-								? [
-										["installed-apps", "Installed Apps"],
-										["power-options", "Power Options"],
-										["device-manager", "Device Manager"],
-										["network-connections", "Network Connections"],
-										["disk-management", "Disk Management"],
-										["computer-management", "Computer Management"],
-										["task-manager", "Task Manager"],
-										["settings", "Settings"]
-									]
-								: [
-										["task-manager", "Task Manager"],
-										["taskbar-settings", "Taskbar Settings"]
-									]
-							).map(([action, label]) => (
+			<AnimatePresence>
+				{detachBubble && (
+					<motion.div
+						key={detachBubble.key}
+						className="dock-detach-bubble"
+						style={{
+							left: detachBubble.x - detachBubble.width / 2,
+							bottom: popupBottom * scale,
+							width: detachBubble.width,
+							transformOrigin: "bottom center"
+						}}
+						initial={{
+							scaleX: 0.3,
+							scaleY: 0.1,
+							y: 24,
+							opacity: 0.92,
+							borderRadius: "32px"
+						}}
+						animate={{
+							scaleX: 1,
+							scaleY: 1,
+							y: -8,
+							opacity: 0,
+							borderRadius: "16px"
+						}}
+						exit={{ opacity: 0 }}
+						transition={DETACH_SPRING}
+					/>
+				)}
+			</AnimatePresence>
+
+			<AnimatePresence>
+				{contextMenu && (
+					<motion.div
+						key="dock-context-menu"
+						ref={menuRef}
+						className="context-menu dock-context-menu"
+						style={{
+							left: (menuPos?.left ?? contextMenu.x) / scale,
+							top: (menuPos?.top ?? contextMenu.y) / scale,
+							visibility: menuPos ? "visible" : "hidden",
+							zoom: scale,
+							transformOrigin: "bottom center"
+						}}
+						initial={DETACH_INITIAL}
+						animate={DETACH_ANIMATE}
+						exit={DETACH_EXIT}
+						transition={DETACH_SPRING}
+						onClick={(e) => e.stopPropagation()}
+					>
+						{!contextMenu.extra &&
+							!contextMenu.taskView &&
+							(!contextMenu.app || contextMenu.app.path === "start") && (
+							<div
+								style={{
+									maxHeight: Math.max(64, window.innerHeight / scale - 200),
+									overflowY: "auto"
+								}}
+							>
+								{(contextMenu.app
+									? [
+											["installed-apps", "Installed Apps"],
+											["power-options", "Power Options"],
+											["device-manager", "Device Manager"],
+											["network-connections", "Network Connections"],
+											["disk-management", "Disk Management"],
+											["computer-management", "Computer Management"],
+											["task-manager", "Task Manager"],
+											["settings", "Settings"]
+										]
+									: [
+											["task-manager", "Task Manager"],
+											["taskbar-settings", "Taskbar Settings"]
+										]
+								).map(([action, label]) => (
+									<div
+										key={action}
+										className="menu-item"
+										onClick={() => {
+											closeMenu();
+											invoke("open_system_action", { action }).catch(showActionError);
+										}}
+									>
+										{label}
+									</div>
+								))}
+								<div className="menu-divider" />
+							</div>
+						)}
+						{contextMenu.extra ? (
+							<>
 								<div
-									key={action}
+									className="menu-item"
+									onClick={() => {
+										const extra = contextMenu.extra!;
+										closeMenu();
+										handleExtraClick(extra);
+									}}
+								>
+									Open
+								</div>
+								{contextMenu.extra.kind === "drive" && contextMenu.extra.removable && (
+									<div className="menu-item" onClick={() => ejectExtra(contextMenu.extra!)}>
+										Eject
+									</div>
+								)}
+								{contextMenu.extra.kind === "drive" && (
+									<>
+										<div className="menu-divider" />
+										<div
+											className="menu-item quit"
+											onClick={() => hideDriveFromDock(contextMenu.extra!)}
+										>
+											Remove from Dock
+										</div>
+									</>
+								)}
+								{contextMenu.extra.kind === "custom" && (
+									<>
+										<div className="menu-divider" />
+										<div
+											className="menu-item quit"
+											onClick={() => removeExtraFromDock(contextMenu.extra!)}
+										>
+											Remove from Dock
+										</div>
+									</>
+								)}
+							</>
+						) : contextMenu.taskView ? (
+							<>
+								<div
 									className="menu-item"
 									onClick={() => {
 										closeMenu();
-										invoke("open_system_action", { action }).catch(showActionError);
+										openTaskView();
 									}}
 								>
-									{label}
+									Open Task View
 								</div>
-							))}
-							<div className="menu-divider" />
-						</div>
-					)}
-					{contextMenu.extra ? (
-						<>
-							<div
-								className="menu-item"
-								onClick={() => {
-									const extra = contextMenu.extra!;
-									closeMenu();
-									handleExtraClick(extra);
-								}}
-							>
-								Open
-							</div>
-							{contextMenu.extra.kind === "drive" && contextMenu.extra.removable && (
-								<div className="menu-item" onClick={() => ejectExtra(contextMenu.extra!)}>
-									Eject
+								<div className="menu-divider" />
+								<div className="menu-item" onClick={hideTaskView}>
+									Hide Task View
 								</div>
-							)}
-							{contextMenu.extra.kind === "drive" && (
-								<>
-									<div className="menu-divider" />
-									<div
-										className="menu-item quit"
-										onClick={() => hideDriveFromDock(contextMenu.extra!)}
-									>
-										Remove from Dock
-									</div>
-								</>
-							)}
-							{contextMenu.extra.kind === "custom" && (
-								<>
-									<div className="menu-divider" />
-									<div
-										className="menu-item quit"
-										onClick={() => removeExtraFromDock(contextMenu.extra!)}
-									>
-										Remove from Dock
-									</div>
-								</>
-							)}
-						</>
-					) : contextMenu.taskView ? (
-						<>
-							<div
-								className="menu-item"
-								onClick={() => {
-									closeMenu();
-									openTaskView();
-								}}
-							>
-								Open Task View
-							</div>
-							<div className="menu-divider" />
-							<div className="menu-item" onClick={hideTaskView}>
-								Hide Task View
-							</div>
-						</>
-					) : contextMenu.app ? (
-						<>
-							<div className="menu-item" onClick={() => togglePin(contextMenu.app!)}>
-								{contextMenu.app.is_pinned ? "Unpin from Dock" : "Pin to Dock"}
-							</div>
-							{contextMenu.app.is_pinned && contextMenu.app.path !== "start" && (
-								<>
-									<div className="menu-divider" />
-									<div
-										className="menu-item"
-										onClick={() => {
+							</>
+						) : contextMenu.app ? (
+							<>
+								<div className="menu-item" onClick={() => togglePin(contextMenu.app!)}>
+									{contextMenu.app.is_pinned ? "Unpin from Dock" : "Pin to Dock"}
+								</div>
+								{contextMenu.app.is_pinned && contextMenu.app.path !== "start" && (
+									<>
+										<div className="menu-divider" />
+										<div
+											className="menu-item"
+											onClick={() => {
+												const isHost = isBrowserHost(contextMenu.app!.path);
+												const ck = isHost
+													? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}`
+													: contextMenu.app!.path;
+												iconPickerTargetRef.current = ck;
+												closeMenu();
+												setTimeout(() => {
+													document.getElementById("icon-file-input")?.click();
+												}, 50);
+											}}
+										>
+											Change Icon...
+										</div>
+										{(() => {
 											const isHost = isBrowserHost(contextMenu.app!.path);
 											const ck = isHost
 												? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}`
 												: contextMenu.app!.path;
-											iconPickerTargetRef.current = ck;
-											closeMenu();
-											setTimeout(() => {
-												document.getElementById("icon-file-input")?.click();
-											}, 50);
-										}}
-									>
-										Change Icon...
-									</div>
-									{(() => {
-										const isHost = isBrowserHost(contextMenu.app!.path);
-										const ck = isHost
-											? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}`
-											: contextMenu.app!.path;
-										return customIcons[ck] ? (
-											<div
-												className="menu-item"
-												onClick={() => {
-													handleRemoveCustomIcon(contextMenu.app!);
-													closeMenu();
-												}}
-											>
-												Reset Icon
-											</div>
-										) : null;
-									})()}
-								</>
-							)}
-							<div className="menu-divider" />
-							<div
-								className="menu-item"
-								onClick={() => {
-									setShowAddPopup(true);
-									closeMenu();
-								}}
-							>
-								Add App to Dock...
-							</div>
-							<div
-								className="menu-item has-submenu"
-								onMouseEnter={() => setActiveSubmenu("bloom")}
-								onMouseLeave={() => setActiveSubmenu(null)}
-							>
-								Bloom Options
-								<span className="submenu-arrow">▶</span>
-								<div className="submenu">
-									<div
-										className="menu-item"
-										onClick={() => {
-											invoke("open_settings_window");
-											closeMenu();
-										}}
-									>
-										Open Settings
-									</div>
-									<div className="menu-item" onClick={() => invoke("restart_bloom")}>
-										Restart Bloom
-									</div>
-									<div
-										className="menu-item"
-										onClick={() => {
-											handleClearIconCache();
-											closeMenu();
-										}}
-									>
-										Clear Icon Cache
-									</div>
-									<div className="menu-divider" />
-									<div className="menu-item quit" onClick={() => invoke("quit_bloom")}>
-										Quit Bloom
-									</div>
-								</div>
-							</div>
-							{(() => {
-								// App actions sit together just above Close, like the taskbar's
-								// jump list: the app's tray menus, then a new instance.
-								const app = contextMenu.app!;
-								const canOpenNew = app.is_running && app.path !== "start";
-								if (!app.tray_ids?.length && !canOpenNew) return null;
-								return (
-									<>
-										<div className="menu-divider" />
-										{app.tray_ids?.map((id, index, ids) => (
-											<div key={id} className="menu-item" onClick={() => void openTrayMenu(id)}>
-												{ids.length > 1 ? `Tray menu ${index + 1}` : "App tray menu"}
-											</div>
-										))}
-										{canOpenNew && (
-											<div
-												className="menu-item"
-												onClick={() => {
-													handleNewInstance(app);
-													closeMenu();
-												}}
-											>
-												Open New Instance
-											</div>
-										)}
+											return customIcons[ck] ? (
+												<div
+													className="menu-item"
+													onClick={() => {
+														handleRemoveCustomIcon(contextMenu.app!);
+														closeMenu();
+													}}
+												>
+													Reset Icon
+												</div>
+											) : null;
+										})()}
 									</>
-								);
-							})()}
-							{contextMenu.app.is_running && !contextMenu.app.is_background && (
-								<>
-									{contextMenu.app.path === "start" && !contextMenu.app.tray_ids?.length && (
+								)}
+								<div className="menu-divider" />
+								<div
+									className="menu-item"
+									onClick={() => {
+										setShowAddPopup(true);
+										closeMenu();
+									}}
+								>
+									Add App to Dock...
+								</div>
+								<div
+									className="menu-item has-submenu"
+									onMouseEnter={() => setActiveSubmenu("bloom")}
+									onMouseLeave={() => setActiveSubmenu(null)}
+								>
+									Bloom Options
+									<span className="submenu-arrow">▶</span>
+									<div className="submenu">
+										<div
+											className="menu-item"
+											onClick={() => {
+												invoke("open_settings_window");
+												closeMenu();
+											}}
+										>
+											Open Settings
+										</div>
+										<div className="menu-item" onClick={() => invoke("restart_bloom")}>
+											Restart Bloom
+										</div>
+										<div
+											className="menu-item"
+											onClick={() => {
+												handleClearIconCache();
+												closeMenu();
+											}}
+										>
+											Clear Icon Cache
+										</div>
 										<div className="menu-divider" />
-									)}
-									<div
-										className="menu-item quit"
-										onClick={async () => {
-											// Close every window of the item, like the taskbar's
-											// "Close all windows", not just the first one.
-											const app = contextMenu.app;
-											const hwnds =
-												app?.all_hwnds?.map(([hwnd]) => hwnd) ?? (app?.hwnd ? [app.hwnd] : []);
-											await Promise.all(hwnds.map((hwnd) => invoke("close_window", { hwnd })));
-											closeMenu();
-										}}
-									>
-										Close{" "}
-										{contextMenu.app.all_hwnds && contextMenu.app.all_hwnds.length > 1
-											? "all windows"
-											: "window"}
-									</div>
-								</>
-							)}
-						</>
-					) : (
-						<>
-							<div
-								className="menu-item"
-								onClick={() => {
-									setShowAddPopup(true);
-									closeMenu();
-								}}
-							>
-								Add App to Dock...
-							</div>
-							<div
-								className="menu-item has-submenu"
-								onMouseEnter={() => setActiveSubmenu("bloom")}
-								onMouseLeave={() => setActiveSubmenu(null)}
-							>
-								Bloom Options
-								<span className="submenu-arrow">▶</span>
-								<div className="submenu">
-									<div
-										className="menu-item"
-										onClick={() => {
-											invoke("open_settings_window");
-											closeMenu();
-										}}
-									>
-										Open Settings
-									</div>
-									<div className="menu-item" onClick={() => invoke("restart_bloom")}>
-										Restart Bloom
-									</div>
-									<div
-										className="menu-item"
-										onClick={() => {
-											handleClearIconCache();
-											closeMenu();
-										}}
-									>
-										Clear Icon Cache
-									</div>
-									<div className="menu-divider" />
-									<div className="menu-item quit" onClick={() => invoke("quit_bloom")}>
-										Quit Bloom
+										<div className="menu-item quit" onClick={() => invoke("quit_bloom")}>
+											Quit Bloom
+										</div>
 									</div>
 								</div>
-							</div>
-						</>
-					)}
-				</div>
-			)}
+								{(() => {
+									// App actions sit together just above Close, like the taskbar's
+									// jump list: the app's tray menus, then a new instance.
+									const app = contextMenu.app!;
+									const canOpenNew = app.is_running && app.path !== "start";
+									if (!app.tray_ids?.length && !canOpenNew) return null;
+									return (
+										<>
+											<div className="menu-divider" />
+											{app.tray_ids?.map((id, index, ids) => (
+												<div key={id} className="menu-item" onClick={() => void openTrayMenu(id)}>
+													{ids.length > 1 ? `Tray menu ${index + 1}` : "App tray menu"}
+												</div>
+											))}
+											{canOpenNew && (
+												<div
+													className="menu-item"
+													onClick={() => {
+														handleNewInstance(app);
+														closeMenu();
+													}}
+												>
+													Open New Instance
+												</div>
+											)}
+										</>
+									);
+								})()}
+								{contextMenu.app.is_running && !contextMenu.app.is_background && (
+									<>
+										{contextMenu.app.path === "start" && !contextMenu.app.tray_ids?.length && (
+											<div className="menu-divider" />
+										)}
+										<div
+											className="menu-item quit"
+											onClick={async () => {
+												// Close every window of the item, like the taskbar's
+												// "Close all windows", not just the first one.
+												const app = contextMenu.app;
+												const hwnds =
+													app?.all_hwnds?.map(([hwnd]) => hwnd) ?? (app?.hwnd ? [app.hwnd] : []);
+												await Promise.all(hwnds.map((hwnd) => invoke("close_window", { hwnd })));
+												closeMenu();
+											}}
+										>
+											Close{" "}
+											{contextMenu.app.all_hwnds && contextMenu.app.all_hwnds.length > 1
+												? "all windows"
+												: "window"}
+										</div>
+									</>
+								)}
+							</>
+						) : (
+							<>
+								<div
+									className="menu-item"
+									onClick={() => {
+										setShowAddPopup(true);
+										closeMenu();
+									}}
+								>
+									Add App to Dock...
+								</div>
+								<div
+									className="menu-item has-submenu"
+									onMouseEnter={() => setActiveSubmenu("bloom")}
+									onMouseLeave={() => setActiveSubmenu(null)}
+								>
+									Bloom Options
+									<span className="submenu-arrow">▶</span>
+									<div className="submenu">
+										<div
+											className="menu-item"
+											onClick={() => {
+												invoke("open_settings_window");
+												closeMenu();
+											}}
+										>
+											Open Settings
+										</div>
+										<div className="menu-item" onClick={() => invoke("restart_bloom")}>
+											Restart Bloom
+										</div>
+										<div
+											className="menu-item"
+											onClick={() => {
+												handleClearIconCache();
+												closeMenu();
+											}}
+										>
+											Clear Icon Cache
+										</div>
+										<div className="menu-divider" />
+										<div className="menu-item quit" onClick={() => invoke("quit_bloom")}>
+											Quit Bloom
+										</div>
+									</div>
+								</div>
+							</>
+						)}
+					</motion.div>
+				)}
+			</AnimatePresence>
 
 			<input
 				id="icon-file-input"
@@ -2181,15 +2499,36 @@ const Dock = memo(function Dock() {
 			/>
 
 			<AnimatePresence>
+				{showSearchPopup && (
+					<BloomSearchPopup
+						containerRef={searchPopupRef}
+						onClose={closePopup}
+						onLaunchApp={(app: AppInfo) => {
+							closePopup();
+							handleAppClick(app);
+						}}
+						onNativeWindowsSearch={() => {
+							closePopup();
+							invoke("open_system_action", { action: "search" }).catch(showActionError);
+						}}
+						scale={scale}
+						runningApps={activeApps}
+						bottom={popupBottom}
+					/>
+				)}
+			</AnimatePresence>
+
+			<AnimatePresence>
 				{showTrayPopup && (
 					<div className="add-popup-anchor" style={{ zoom: scale, bottom: popupBottom }}>
 						<motion.div
 							ref={trayPopupRef}
 							className="tray-overflow-popup"
-							initial={{ opacity: 0, y: 12 }}
-							animate={{ opacity: 1, y: 0 }}
-							exit={{ opacity: 0, y: 8 }}
-							transition={{ duration: 0.16 }}
+							style={{ transformOrigin: "bottom center" }}
+							initial={DETACH_INITIAL}
+							animate={DETACH_ANIMATE}
+							exit={DETACH_EXIT}
+							transition={DETACH_SPRING}
 							onClick={(e) => e.stopPropagation()}
 						>
 							<div className="tray-overflow-header">
@@ -2293,6 +2632,243 @@ const Dock = memo(function Dock() {
 		</div>
 	);
 });
+
+function BloomSearchPopup({
+	onClose,
+	onLaunchApp,
+	onNativeWindowsSearch,
+	containerRef,
+	scale,
+	runningApps,
+	bottom
+}: {
+	onClose: () => void;
+	onLaunchApp: (app: AppInfo) => void;
+	onNativeWindowsSearch: () => void;
+	containerRef: React.RefObject<HTMLDivElement | null>;
+	scale: number;
+	runningApps: AppInfo[];
+	bottom: number;
+}) {
+	const [apps, setApps] = useState<AppInfo[]>([]);
+	const [search, setSearch] = useState("");
+	const [loading, setLoading] = useState(true);
+	const [listIcons, setListIcons] = useState<Record<string, string>>({});
+	const [selectedIndex, setSelectedIndex] = useState(0);
+	const inputRef = useRef<HTMLInputElement>(null);
+	const listRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		inputRef.current?.focus();
+	}, []);
+
+	useEffect(() => {
+		let mounted = true;
+		invoke<AppInfo[]>("get_installed_apps")
+			.then((res) => {
+				if (mounted) {
+					setApps(res.sort((a, b) => a.name.localeCompare(b.name)));
+				}
+			})
+			.finally(() => {
+				if (mounted) setLoading(false);
+			});
+		return () => {
+			mounted = false;
+		};
+	}, []);
+
+	const sections = useMemo(() => {
+		const q = search.trim().toLowerCase();
+		const active = runningApps.filter(
+			(a) => a.path !== "start" && (!q || a.name.toLowerCase().includes(q))
+		);
+		const activeKeys = new Set(active.map((a) => itemKey(a)));
+		const installed = apps
+			.filter(
+				(a) =>
+					a.path !== "start" &&
+					!activeKeys.has(itemKey(a)) &&
+					(!q || a.name.toLowerCase().includes(q))
+			)
+			.sort((x, y) => {
+				if (!q) return x.name.localeCompare(y.name);
+				const xs = x.name.toLowerCase().startsWith(q) ? 0 : 1;
+				const ys = y.name.toLowerCase().startsWith(q) ? 0 : 1;
+				return xs - ys || x.name.localeCompare(y.name);
+			})
+			.slice(0, q ? 30 : 18);
+
+		const out: { title: string; items: AppInfo[]; isRunning?: boolean }[] = [];
+		if (active.length > 0) {
+			out.push({ title: "Fenêtres actives", items: active.slice(0, 8), isRunning: true });
+		}
+		if (installed.length > 0) {
+			out.push({ title: "Applications", items: installed });
+		}
+		return out;
+	}, [apps, runningApps, search]);
+
+	const flat = useMemo(() => sections.flatMap((s) => s.items), [sections]);
+	const flatIndex = useMemo(() => new Map(flat.map((a, i) => [a, i])), [flat]);
+
+	useEffect(() => {
+		setSelectedIndex(0);
+	}, [search]);
+
+	useEffect(() => {
+		if (!listRef.current) return;
+		const row = listRef.current.querySelector(
+			`[data-idx="${selectedIndex}"]`
+		) as HTMLElement | null;
+		if (row) row.scrollIntoView({ block: "nearest" });
+	}, [selectedIndex]);
+
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") {
+				onClose();
+				return;
+			}
+			if (e.key === "ArrowDown") {
+				e.preventDefault();
+				setSelectedIndex((i) => Math.min(i + 1, Math.max(0, flat.length - 1)));
+			} else if (e.key === "ArrowUp") {
+				e.preventDefault();
+				setSelectedIndex((i) => Math.max(i - 1, 0));
+			} else if (e.key === "Enter") {
+				e.preventDefault();
+				if (e.ctrlKey || e.metaKey || flat.length === 0) {
+					onNativeWindowsSearch();
+					return;
+				}
+				const target = flat[selectedIndex];
+				if (target) onLaunchApp(target);
+			}
+		};
+		const handleMouseDown = (e: MouseEvent) => {
+			const popup = containerRef.current;
+			if (popup && !popup.contains(e.target as Node)) {
+				onClose();
+			}
+		};
+		const handleBlur = () => onClose();
+		window.addEventListener("keydown", handleKeyDown);
+		window.addEventListener("blur", handleBlur);
+		document.addEventListener("mousedown", handleMouseDown, true);
+		return () => {
+			window.removeEventListener("keydown", handleKeyDown);
+			window.removeEventListener("blur", handleBlur);
+			document.removeEventListener("mousedown", handleMouseDown, true);
+		};
+	}, [onClose, containerRef, flat, selectedIndex, onLaunchApp, onNativeWindowsSearch]);
+
+	useEffect(() => {
+		let active = true;
+		const targets = flat.slice(0, 24).filter((a) => !listIcons[a.path]);
+		if (targets.length === 0) return;
+		Promise.all(
+			targets.map(async (app) => {
+				try {
+					const brand = cleanBrandIcon(app);
+					if (brand) return [app.path, brand] as const;
+					const icon = await invoke<string | null>("get_app_icon", { path: app.path });
+					return [app.path, icon] as const;
+				} catch {
+					return [app.path, null] as const;
+				}
+			})
+		).then((pairs) => {
+			if (!active) return;
+			const batch: Record<string, string> = {};
+			for (const [path, icon] of pairs) if (icon) batch[path] = icon;
+			if (Object.keys(batch).length > 0) setListIcons((prev) => ({ ...prev, ...batch }));
+		});
+		return () => {
+			active = false;
+		};
+	}, [flat, listIcons]);
+
+	return (
+		<div className="add-popup-anchor" style={{ zoom: scale, bottom }}>
+			<motion.div
+				ref={containerRef}
+				className="dock-search-popup"
+				style={{ transformOrigin: "bottom center" }}
+				initial={DETACH_INITIAL}
+				animate={DETACH_ANIMATE}
+				exit={DETACH_EXIT}
+				transition={DETACH_SPRING}
+				onClick={(e) => e.stopPropagation()}
+			>
+				<div className="popup-search-row dock-search-header">
+					<Search className="popup-search-icon" size={16} aria-hidden="true" />
+					<input
+						ref={inputRef}
+						type="text"
+						className="popup-search-input dock-search-input"
+						placeholder="Rechercher une application, une fenêtre ou sur Windows…"
+						value={search}
+						onChange={(e) => setSearch(e.target.value)}
+					/>
+					<span className="dock-search-kbd">Entrée</span>
+				</div>
+				<div className="popup-apps-scroll dock-search-results" ref={listRef}>
+					{loading && flat.length === 0 ? (
+						<div className="popup-empty">Chargement de l’index des applications…</div>
+					) : flat.length > 0 ? (
+						sections.map((sec) => (
+							<div key={sec.title}>
+								<div className="popup-section-label">{sec.title}</div>
+								{sec.items.map((app) => {
+									const gi = flatIndex.get(app) ?? 0;
+									const icon = cleanBrandIcon(app) || listIcons[app.path] || app.icon;
+									return (
+										<div
+											key={`${app.path}::${app.name}`}
+											data-idx={gi}
+											className={`popup-app-row${gi === selectedIndex ? " selected" : ""}`}
+											onClick={() => onLaunchApp(app)}
+											onMouseEnter={() => setSelectedIndex(gi)}
+										>
+											<div className="popup-app-icon">
+												{icon ? (
+													<img src={icon} alt="" draggable={false} />
+												) : (
+													<span className="popup-app-initial">{app.name[0]}</span>
+												)}
+											</div>
+											<span className="popup-app-name">{app.name}</span>
+											{sec.isRunning ? (
+												<span className="dock-search-badge">Actif</span>
+											) : (
+												<span className="dock-search-open-hint">Ouvrir ↵</span>
+											)}
+										</div>
+									);
+								})}
+							</div>
+						))
+					) : (
+						<div className="popup-empty">
+							Aucune application locale pour « {search.trim()} » — appuyez sur Entrée pour rechercher sur Windows
+						</div>
+					)}
+				</div>
+				<div className="dock-search-footer">
+					<button
+						type="button"
+						className="dock-search-win-btn"
+						onClick={onNativeWindowsSearch}
+					>
+						<Search size={13} aria-hidden="true" />
+						<span>Recherche Windows approfondie (Win+S)</span>
+					</button>
+				</div>
+			</motion.div>
+		</div>
+	);
+}
 
 function AddAppPopup({
 	onClose,
@@ -2488,13 +3064,10 @@ function AddAppPopup({
 				ref={containerRef}
 				className="add-app-popup"
 				style={{ transformOrigin: "bottom center" }}
-				initial={{ opacity: 0, scaleY: 0 }}
-				animate={{ opacity: 1, scaleY: 1 }}
-				exit={{ opacity: 0, scaleY: 0, transition: { duration: 0.16, ease: "easeIn" } }}
-				transition={{
-					opacity: { duration: 0.15 },
-					scaleY: { type: "spring", stiffness: 300, damping: 28, mass: 0.9 }
-				}}
+				initial={DETACH_INITIAL}
+				animate={DETACH_ANIMATE}
+				exit={DETACH_EXIT}
+				transition={DETACH_SPRING}
 				onClick={(e) => e.stopPropagation()}
 			>
 				<div className="popup-search-row">
