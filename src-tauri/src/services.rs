@@ -4502,14 +4502,17 @@ mod tests {
     }
 
     #[test]
-    fn only_fixed_notch_mode_reserves_the_work_area() {
-        assert!(notch_mode_reserves_work_area(Some("fixed")));
+    fn floating_notch_never_reserves_the_work_area() {
+        // This branch intentionally removed the top AppBar in every mode.
+        // Keep that behavior protected while testing unrelated dock changes.
+        assert!(!notch_mode_reserves_work_area(Some("fixed")));
         assert!(!notch_mode_reserves_work_area(Some("smart")));
         assert!(!notch_mode_reserves_work_area(Some("peek")));
         // Legacy alias for smart
         assert!(!notch_mode_reserves_work_area(Some("auto-hide")));
-        // Unset defaults to fixed, matching SETTINGS.md
-        assert!(notch_mode_reserves_work_area(None));
+        // The default and unknown modes must not bring back the top band.
+        assert!(!notch_mode_reserves_work_area(None));
+        assert!(!notch_mode_reserves_work_area(Some("unknown")));
     }
 
     #[test]

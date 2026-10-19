@@ -65,4 +65,7 @@ Le workflow lance la compilation TypeScript/Vite, les tests Bun existants,
 `cargo test --locked`, puis la compilation Tauri sans installateur.
 Des tests Rust couvrent le placement aux bords d’écran, les coordonnées
 négatives, les petits écrans et les dimensions physiques agrandies.
+Un ancien test du notch attendait encore une réservation supérieure alors que
+la branche source l’avait supprimée dans tous les modes. Seules ses assertions
+ont été actualisées pour protéger le comportement actuel, sans changer le notch.
 La validation visuelle et les menus réels restent à confirmer sur le PC utilisateur.
