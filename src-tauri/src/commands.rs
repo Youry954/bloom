@@ -458,6 +458,9 @@ pub async fn change_dock_mode(app: AppHandle, mode: String) {
 pub async fn change_notch_mode(app: AppHandle, mode: String) {
     if let Some(main_win) = app.get_webview_window("main") {
         if mode == "fixed" {
+            // L'ancienne inscription AppBar affichait aussi la fenêtre.
+            // La nouvelle surcouche doit la montrer explicitement.
+            let _ = main_win.show();
             crate::services::apply_main_appbar_mode(&app, true);
         } else {
             let _ = main_win.show();
