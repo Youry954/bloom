@@ -2,6 +2,7 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, memo } from "rea
 import { motion, AnimatePresence, Reorder } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Search, ChevronUp, MoreHorizontal, RefreshCw } from "lucide-react";
 import "./Dock.css";
 import { EdgeSurface } from "./components/EdgeSurface";
 import { initTheme } from "./theme";
@@ -104,6 +105,21 @@ const fileOf = (p: string) =>
 // running in the same browser must never be matched by their shared exe name.
 const isIdentifier = (p: string) => !p.includes("/") && !p.includes("\\");
 
+// Windows Store icons can contain an opaque blue/white plate baked into the
+// image itself. For these two known apps use clean transparent vector marks
+// instead of trying to cut pixels out of arbitrary user icons.
+function cleanBrandIcon(app: AppInfo): string | null {
+	const name = app.name.trim().toLowerCase();
+	const path = app.path.toLowerCase();
+	if (name === "chatgpt" || name === "chat gpt" || /openai\.chatgpt|chatgpt\.exe|chatgpt_/.test(path)) {
+		return "/brand-clean-chatgpt.svg";
+	}
+	if (name === "whatsapp" || /whatsapp\.exe|whatsappdesktop|whatsapp_/.test(path)) {
+		return "/brand-clean-whatsapp.svg";
+	}
+	return null;
+}
+
 // Resolve the configured start-button icon to a public asset, or to the data
 // URI of a user-uploaded icon (stored with a "custom:" prefix).
 // Task View's glyph: a window in front of another, as on the taskbar.
@@ -197,6 +213,10 @@ const Dock = memo(function Dock() {
 	const [isOverlapped, setIsOverlapped] = useState(false);
 	const [isVisible, setIsVisible] = useState(true);
 	const [showAddPopup, setShowAddPopup] = useState(false);
+	const [showTrayPopup, setShowTrayPopup] = useState(false);
+	const [trayItems, setTrayItems] = useState<TrayApp[]>([]);
+	const [trayIcons, setTrayIcons] = useState<Record<string, string>>({});
+	const [trayLoading, setTrayLoading] = useState(false);
 	const [nativeMenuOpen, setNativeMenuOpen] = useState(false);
 	const [contextMenu, setContextMenu] = useState<{
 		x: number;
@@ -265,7 +285,7 @@ const Dock = memo(function Dock() {
 
 	const isCurrentlyHovered = isDockHovered || isEdgeHovered;
 	const [interactionState, setInteractionState] = useState<"active" | "grace" | "none">("none");
-	const isAnyInteraction = isCurrentlyHovered || !!contextMenu || showAddPopup || nativeMenuOpen;
+	const isAnyInteraction = isCurrentlyHovered || !!contextMenu || showAddPopup || showTrayPopup || nativeMenuOpen;
 
 	const previewTimerRef = useRef<any>(null);
 	const isPreviewHoveredRef = useRef(false);
@@ -738,6 +758,7 @@ const Dock = memo(function Dock() {
 
 	const menuRef = useRef<HTMLDivElement>(null);
 	const popupRef = useRef<HTMLDivElement>(null);
+	const trayPopupRef = useRef<HTMLDivElement>(null);
 
 	const showActionError = (error: unknown) => {
 		if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -843,7 +864,55 @@ const Dock = memo(function Dock() {
 
 	const closePopup = () => {
 		setShowAddPopup(false);
+		setShowTrayPopup(false);
 		invoke("set_menu_open", { open: false, rect: null }).catch(() => {});
+	};
+
+	// Show live Windows notification icons in a compact, reversible overflow
+	// panel. The backend already discovers icon IDs and safely invokes each
+	// app's native menu; do not terminate processes behind the user's back.
+	useEffect(() => {
+		if (!showTrayPopup) return;
+		let active = true;
+		const load = async () => {
+			try {
+				const items = await invoke<TrayApp[]>("get_tray_apps");
+				if (!active) return;
+				setTrayItems(items.filter((app) => app.tray_ids.length > 0));
+				setTrayLoading(false);
+				const uniquePaths = [...new Set(items.map((app) => app.path))];
+				const icons = await Promise.all(uniquePaths.map(async (path) => {
+					try {
+						return [path, await invoke<string | null>("get_app_icon", { path })] as const;
+					} catch {
+						return [path, null] as const;
+					}
+				}));
+				if (active) setTrayIcons((prev) => ({
+					...prev,
+					...Object.fromEntries(icons.filter((pair): pair is readonly [string, string] => !!pair[1]))
+				}));
+			} catch (error) {
+				if (active) {
+					setTrayLoading(false);
+					console.error("Could not enumerate system tray apps:", error);
+				}
+			}
+		};
+		setTrayLoading(true);
+		load();
+		const interval = setInterval(load, 5000);
+		return () => {
+			active = false;
+			clearInterval(interval);
+		};
+	}, [showTrayPopup]);
+
+	const toggleTrayPopup = () => {
+		setShowAddPopup(false);
+		setContextMenu(null);
+		setActiveSubmenu(null);
+		setShowTrayPopup((open) => !open);
 	};
 
 	// A press outside the dock while a menu or the Add App popup is open. The
@@ -854,6 +923,7 @@ const Dock = memo(function Dock() {
 			setContextMenu(null);
 			setActiveSubmenu(null);
 			setShowAddPopup(false);
+			setShowTrayPopup(false);
 		});
 		return () => {
 			unlisten.then((f) => f());
@@ -908,6 +978,13 @@ const Dock = memo(function Dock() {
 			const a = anchor.getBoundingClientRect();
 			wanted.push(padRect({ x: p.left, y: a.top, width: p.width, height: a.height }, 40));
 		}
+		const trayPanel = trayPopupRef.current;
+		const trayAnchor = trayPanel?.parentElement;
+		if (trayPanel && trayAnchor) {
+			const p = trayPanel.getBoundingClientRect();
+			const a = trayAnchor.getBoundingClientRect();
+			wanted.push(padRect({ x: p.left, y: a.top, width: p.width, height: a.height }, 40));
+		}
 		sendDockRegion(wanted);
 	});
 
@@ -922,6 +999,16 @@ const Dock = memo(function Dock() {
 				y: Math.round(r.y),
 				width: Math.round(r.width + (activeSubmenu ? 160 : 0)),
 				height: Math.round(r.height)
+			};
+			open = true;
+		} else if (showTrayPopup && trayPopupRef.current) {
+			const r = trayPopupRef.current.getBoundingClientRect();
+			const anchor = trayPopupRef.current.parentElement?.getBoundingClientRect();
+			rect = {
+				x: Math.round(r.x),
+				y: Math.round(anchor?.top ?? r.y),
+				width: Math.round(r.width),
+				height: Math.round(anchor?.height ?? r.height)
 			};
 			open = true;
 		} else if (showAddPopup && popupRef.current) {
@@ -941,7 +1028,7 @@ const Dock = memo(function Dock() {
 		}
 
 		invoke("set_menu_open", { open, rect }).catch(() => {});
-	}, [contextMenu, menuPos, showAddPopup, pinnedApps, activeApps, activeSubmenu, scale]);
+	}, [contextMenu, menuPos, showAddPopup, showTrayPopup, trayItems, pinnedApps, activeApps, activeSubmenu, scale]);
 
 	const dockItems = useMemo(() => {
 		const runningMap = new Map();
@@ -1340,6 +1427,37 @@ const Dock = memo(function Dock() {
 									</motion.div>
 								)}
 
+								{/* Native Windows Search, styled like a compact Windows 11 pill. */}
+								<motion.button
+									type="button"
+									className="dock-search-pill"
+									title="Rechercher sur Windows"
+									aria-label="Rechercher sur Windows"
+									onClick={(e) => {
+										e.stopPropagation();
+										closePopup();
+										invoke("open_system_action", { action: "search" }).catch(showActionError);
+									}}
+								>
+									<Search size={15} aria-hidden="true" />
+									<span>Recherche</span>
+								</motion.button>
+
+								{/* Windows notification overflow, with native app menus. */}
+								<motion.button
+									type="button"
+									className={`dock-tray-toggle${showTrayPopup ? " is-open" : ""}`}
+									title="Applications en arrière-plan"
+									aria-label="Afficher les applications en arrière-plan"
+									aria-expanded={showTrayPopup}
+									onClick={(e) => {
+										e.stopPropagation();
+										toggleTrayPopup();
+									}}
+								>
+									<ChevronUp size={18} aria-hidden="true" />
+								</motion.button>
+
 								{dockTaskView && (
 									<motion.div
 										key="task-view"
@@ -1525,9 +1643,11 @@ const Dock = memo(function Dock() {
 														// browser and its PWAs share one path, so it would leak one item's
 														// icon onto the others.
 														const allowPathFallback = !isHost || !app.is_running;
+														const brandIcon = cleanBrandIcon(app);
 														const icon =
 															customIcons[cacheKey] ||
 															(allowPathFallback && customIcons[app.path]) ||
+															brandIcon ||
 															iconsRef.current[cacheKey] ||
 															(allowPathFallback && iconsRef.current[app.path]) ||
 															app.icon;
@@ -1541,7 +1661,7 @@ const Dock = memo(function Dock() {
 															<img
 																src={icon}
 																alt={app.name}
-																className={isBloomOrSettings ? "bloom-icon-img" : ""}
+																className={brandIcon ? "dock-brand-icon" : isBloomOrSettings ? "bloom-icon-img" : ""}
 																draggable={false}
 															/>
 														) : (
@@ -1684,9 +1804,11 @@ const Dock = memo(function Dock() {
 												// browser and its PWAs share one path, so it would leak one item's
 												// icon onto the others.
 												const allowPathFallback = !isHost || !app.is_running;
+												const brandIcon = cleanBrandIcon(app);
 												const icon =
 													customIcons[cacheKey] ||
 													(allowPathFallback && customIcons[app.path]) ||
+													brandIcon ||
 													iconsRef.current[cacheKey] ||
 													(allowPathFallback && iconsRef.current[app.path]) ||
 													app.icon;
@@ -1698,7 +1820,7 @@ const Dock = memo(function Dock() {
 													<img
 														src={icon}
 														alt={app.name}
-														className={isBloomOrSettings ? "bloom-icon-img" : ""}
+														className={brandIcon ? "dock-brand-icon" : isBloomOrSettings ? "bloom-icon-img" : ""}
 														draggable={false}
 													/>
 												) : (
@@ -2037,6 +2159,85 @@ const Dock = memo(function Dock() {
 				style={{ display: "none" }}
 				onChange={handleIconFileSelect}
 			/>
+
+			<AnimatePresence>
+				{showTrayPopup && (
+					<div className="add-popup-anchor" style={{ zoom: scale, bottom: popupBottom }}>
+						<motion.div
+							ref={trayPopupRef}
+							className="tray-overflow-popup"
+							initial={{ opacity: 0, y: 12 }}
+							animate={{ opacity: 1, y: 0 }}
+							exit={{ opacity: 0, y: 8 }}
+							transition={{ duration: 0.16 }}
+							onClick={(e) => e.stopPropagation()}
+						>
+							<div className="tray-overflow-header">
+								<span>Applications en arrière-plan</span>
+								<button
+									type="button"
+									className="tray-refresh"
+									aria-label="Actualiser les applications"
+									onClick={() => {
+										setTrayLoading(true);
+										invoke<TrayApp[]>("get_tray_apps")
+											.then((items) => setTrayItems(items.filter((app) => app.tray_ids.length > 0)))
+											.catch(showActionError)
+											.finally(() => setTrayLoading(false));
+									}}
+								>
+									<RefreshCw size={15} />
+								</button>
+							</div>
+							<div className="tray-overflow-list">
+								{trayLoading && trayItems.length === 0 ? (
+									<div className="tray-empty">Chargement des applications…</div>
+								) : trayItems.length === 0 ? (
+									<div className="tray-empty">Aucune icône de notification détectée.</div>
+								) : trayItems.map((app) => (
+									<div key={app.path} className="tray-overflow-row">
+										<button
+											type="button"
+											className="tray-overflow-app"
+											aria-label={`Ouvrir ${app.name}`}
+											onClick={() => {
+												setShowTrayPopup(false);
+												invoke("activate_tray_icon", { trayId: app.tray_ids[0] }).catch(showActionError);
+											}}
+										>
+											{trayIcons[app.path] ? (
+												<img src={trayIcons[app.path]} alt="" draggable={false} />
+											) : (
+												<span className="tray-overflow-initial">{app.name.charAt(0)}</span>
+											)}
+											<span className="tray-overflow-name">{app.name}</span>
+										</button>
+										<button
+											type="button"
+											className="tray-overflow-actions"
+											title={`Options de ${app.name} (Quitter, paramètres…)`}
+											aria-label={`Options de ${app.name}`}
+											onClick={() => {
+												setShowTrayPopup(false);
+												void openTrayMenu(app.tray_ids[0]);
+											}}
+										>
+											<MoreHorizontal size={18} />
+										</button>
+									</div>
+								))}
+							</div>
+							<div className="tray-overflow-footer">
+								<button type="button" onClick={() => {
+									setShowTrayPopup(false);
+									invoke("open_system_action", { action: "task-manager" }).catch(showActionError);
+								}}>Gestionnaire des tâches</button>
+								<span>Les options « Quitter » dépendent de chaque application.</span>
+							</div>
+						</motion.div>
+					</div>
+				)}
+			</AnimatePresence>
 
 			<AnimatePresence>
 				{showAddPopup && (

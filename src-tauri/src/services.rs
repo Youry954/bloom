@@ -1553,8 +1553,23 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                                     let is_primary = is_primary_monitor(mi.dwFlags);
                                     let is_maximized =
                                         IsZoomed(hwnd).as_bool() || (style & WS_MAXIMIZE.0) != 0;
+                                    // ChatGPT's Windows desktop app can use a borderless
+                                    // maximized window. Its lack of WS_CAPTION used to be
+                                    // mistaken for exclusive fullscreen, hiding Bloom's
+                                    // notch and dock as if a game was running.
+                                    // Keep the ordinary fullscreen protection for games.
+                                    let mut window_pid = 0u32;
+                                    GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+                                    let is_chatgpt_desktop = is_maximized
+                                        && crate::commands::process_image_path(window_pid)
+                                            .is_some_and(|p| {
+                                                std::path::Path::new(&p)
+                                                    .file_name()
+                                                    .is_some_and(|name| name.eq_ignore_ascii_case("ChatGPT.exe"))
+                                            });
                                     let is_maximized_standard =
-                                        is_maximized && (style & WS_CAPTION.0) != 0;
+                                        is_maximized
+                                            && ((style & WS_CAPTION.0) != 0 || is_chatgpt_desktop);
 
                                     let mut is_client_fullscreen = false;
                                     let mut client_rect = RECT::default();
@@ -3006,11 +3021,11 @@ unsafe fn dock_takes_press(point: windows::Win32::Foundation::POINT) -> bool {
     if GetWindowRect(hwnd, &mut bounds).is_err() {
         return false;
     }
-    // The animated Add App panel is focusable even when the mouse watchdog
-    // has not yet cleared WS_EX_TRANSPARENT. Do not interpret its first click
-    // as an outside press and dismiss the whole menu. Coordinates reported
-    // by the webview are CSS pixels; the hook receives physical pixels.
-    if DOCK_POPUP_FOCUS_ACTIVE.load(Ordering::Relaxed) {
+    // Animated Add App and notification overflow panels can still be
+    // temporarily click-through before the mouse watchdog catches up.
+    // Do not interpret a press inside the reported panel as outside.
+    // The webview reports CSS pixels while the mouse hook receives physical.
+    if MENU_IS_OPEN.load(Ordering::Relaxed) {
         if let Ok(guard) = MENU_RECT.try_lock() {
             if let Some(r) = *guard {
                 let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
