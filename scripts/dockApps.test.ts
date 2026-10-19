@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mergeTrayApps, selectDockTrayApps, type AppInfo, type TrayApp } from "../src/dockApps";
+import { appIdentity, isBrowserBackedApp, isSameApp, mergeTrayApps, selectDockTrayApps, type AppInfo, type TrayApp } from "../src/dockApps";
 const tray: TrayApp = {
 	name: "Discord",
 	path: "C:\\Apps\\Discord.exe",
@@ -78,5 +78,47 @@ describe("dock tray lifecycle", () => {
 	test("does not match a different process by display name", () => {
 		const other = { ...windowApp, hwnd: 99, all_hwnds: [[99, "Discord"]] as [number, string][] };
 		expect(mergeTrayApps([other], [tray])).toHaveLength(2);
+	});
+});
+
+describe("pinned and running app reconciliation", () => {
+	const app = (name: string, path: string, executable?: string): AppInfo => ({
+		name, path, executable, icon: null, is_running: false
+	});
+	test("matches Google Chrome pinned as a shortcut to its running browser window", () => {
+		const pin = app("Google Chrome", "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Google Chrome.lnk", "chrome.exe");
+		const running = app("Google Chrome", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "chrome.exe");
+		expect(isSameApp(pin, running)).toBe(true);
+	});
+	test("matches the Chrome AppsFolder entry to the running browser window", () => {
+		const pin = app("Google Chrome", "Chrome");
+		const running = app("Google Chrome", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "chrome.exe");
+		expect(isSameApp(pin, running)).toBe(true);
+	});
+	test("does not merge Chrome with its PWAs", () => {
+		const chrome = app("Google Chrome", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "chrome.exe");
+		const youtube = app("YouTube", "C:\\Users\\me\\Start Menu\\YouTube.lnk", "chrome.exe");
+		expect(isSameApp(chrome, youtube)).toBe(false);
+		expect(isBrowserBackedApp(youtube)).toBe(true);
+	});
+	test("matches a browser PWA shortcut to its running window", () => {
+		const youtube = app("YouTube", "C:\\Users\\me\\Start Menu\\YouTube.lnk", "chrome.exe");
+		const running = app("YouTube", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "chrome.exe");
+		expect(isSameApp(youtube, running)).toBe(true);
+	});
+	test("keeps independent Chrome PWAs separate even with the same host executable", () => {
+		const youtube = app("YouTube", "C:\\Users\\me\\Start Menu\\YouTube.lnk", "chrome.exe");
+		const drive = app("Google Drive", "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "chrome.exe");
+		expect(isSameApp(youtube, drive)).toBe(false);
+	});
+	test("does not merge different Chrome AUMID/PWA shell identities", () => {
+		expect(isSameApp(app("YouTube", "Chrome._abc!PWA1", "chrome.exe"), app("YouTube", "Chrome._def!PWA2", "chrome.exe"))).toBe(false);
+	});
+	test("continues matching a normal pinned .lnk with its running executable", () => {
+		expect(isSameApp(app("Microsoft Word", "C:\\Users\\me\\Start Menu\\Word.lnk", "WINWORD.EXE"), app("Word", "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE", "WINWORD.EXE"))).toBe(true);
+	});
+	test("preserves app identity for host windows with different PWA names", () => {
+		const path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+		expect(appIdentity(path, "chrome.exe", "YouTube")).not.toBe(appIdentity(path, "chrome.exe", "Gmail"));
 	});
 });
