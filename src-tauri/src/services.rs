@@ -3021,11 +3021,11 @@ unsafe fn dock_takes_press(point: windows::Win32::Foundation::POINT) -> bool {
     if GetWindowRect(hwnd, &mut bounds).is_err() {
         return false;
     }
-    // The animated Add App panel is focusable even when the mouse watchdog
-    // has not yet cleared WS_EX_TRANSPARENT. Do not interpret its first click
-    // as an outside press and dismiss the whole menu. Coordinates reported
-    // by the webview are CSS pixels; the hook receives physical pixels.
-    if DOCK_POPUP_FOCUS_ACTIVE.load(Ordering::Relaxed) {
+    // Animated Add App and notification overflow panels can still be
+    // temporarily click-through before the mouse watchdog catches up.
+    // Do not interpret a press inside the reported panel as outside.
+    // The webview reports CSS pixels while the mouse hook receives physical.
+    if MENU_IS_OPEN.load(Ordering::Relaxed) {
         if let Ok(guard) = MENU_RECT.try_lock() {
             if let Some(r) = *guard {
                 let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
