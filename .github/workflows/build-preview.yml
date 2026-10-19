@@ -55,7 +55,7 @@ jobs:
         run: bun run build
 
       - name: Tester le dock et les régions des fenêtres
-        run: bun test scripts/*.test.ts
+        run: bun test ./scripts
 
       - name: Vérifier Rust
         run: cargo check --locked
