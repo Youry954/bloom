@@ -23,6 +23,38 @@ pub async fn set_menu_open(open: bool, rect: Option<IntRect>) {
     }
 }
 
+/// Temporarily make the floating dock focusable only for the Add App search.
+/// Normal dock clicks remain non-activating to avoid stealing focus from apps.
+#[tauri::command]
+pub fn set_dock_popup_focus(app: AppHandle, active: bool) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    };
+    let win = app
+        .get_webview_window("dock")
+        .ok_or_else(|| "Dock window is not available".to_string())?;
+    let hwnd = win.hwnd().map_err(|e| e.to_string())?;
+    DOCK_POPUP_FOCUS_ACTIVE.store(active, Ordering::Relaxed);
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as usize;
+        let new_style = if active {
+            style & !(WS_EX_NOACTIVATE.0 as usize)
+        } else {
+            style | WS_EX_NOACTIVATE.0 as usize
+        };
+        if new_style != style {
+            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize);
+        }
+    }
+    if active {
+        // Called while the Add App popup is opening from a user click.
+        // Once WS_EX_NOACTIVATE is cleared WebView2's search input can
+        // receive real keyboard focus; CSS/DOM focus alone cannot do this.
+        win.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_dock_hovered(hovered: bool) {
     DOCK_IS_HOVERED.store(hovered, Ordering::Relaxed);

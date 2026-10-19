@@ -4,10 +4,15 @@ on:
   push:
     branches:
       - essai-notches-sans-bandes
+      - correctif-recherche-ajout-dock
     paths:
       - ".github/workflows/build-preview.yml"
       - "src-tauri/src/services.rs"
       - "src-tauri/src/commands.rs"
+      - "src-tauri/src/main.rs"
+      - "src-tauri/src/state.rs"
+      - "src-tauri/src/utils.rs"
+      - "src/Dock.tsx"
   workflow_dispatch:
 
 permissions:
@@ -37,6 +42,9 @@ jobs:
 
       - name: Installer les dépendances
         run: bun install --frozen-lockfile
+
+      - name: Vérifier la compilation du frontend
+        run: bun run build
 
       - name: Construire Bloom sans installateur
         run: bun run tauri build --no-bundle --ci

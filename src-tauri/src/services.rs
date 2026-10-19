@@ -2999,11 +2999,33 @@ unsafe fn dock_takes_press(point: windows::Win32::Foundation::POINT) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
     let hwnd = HWND(DOCK_HWND.load(Ordering::Relaxed) as *mut _);
-    if hwnd.0.is_null() || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 != 0 {
+    if hwnd.0.is_null() {
         return false;
     }
     let mut bounds = RECT::default();
     if GetWindowRect(hwnd, &mut bounds).is_err() {
+        return false;
+    }
+    // The animated Add App panel is focusable even when the mouse watchdog
+    // has not yet cleared WS_EX_TRANSPARENT. Do not interpret its first click
+    // as an outside press and dismiss the whole menu. Coordinates reported
+    // by the webview are CSS pixels; the hook receives physical pixels.
+    if DOCK_POPUP_FOCUS_ACTIVE.load(Ordering::Relaxed) {
+        if let Ok(guard) = MENU_RECT.try_lock() {
+            if let Some(r) = *guard {
+                let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
+                let scale = if dpi > 0 { dpi as f64 / 96.0 } else { 1.0 };
+                let left = bounds.left + (r.x as f64 * scale) as i32;
+                let top = bounds.top + (r.y as f64 * scale) as i32;
+                let right = left + (r.width as f64 * scale) as i32;
+                let bottom = top + (r.height as f64 * scale) as i32;
+                if point.x >= left && point.x < right && point.y >= top && point.y < bottom {
+                    return true;
+                }
+            }
+        }
+    }
+    if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT.0 != 0 {
         return false;
     }
     let region = CreateRectRgn(0, 0, 0, 0);

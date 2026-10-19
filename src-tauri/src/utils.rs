@@ -1218,7 +1218,17 @@ pub fn re_assert_topmost(hwnd: HWND) {
         // Re-stamp NOACTIVATE + TOOLWINDOW — HWND_TOPMOST can cause these to be reset
         // by the shell on some Windows builds
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as usize;
-        let new_ex = ex | WS_EX_NOACTIVATE.0 as usize | WS_EX_TOOLWINDOW.0 as usize;
+        let dock_popup_focused =
+            crate::state::DOCK_POPUP_FOCUS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                && hwnd.0 as isize
+                    == crate::state::DOCK_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        // The Add App search temporarily needs real keyboard focus. Do not
+        // undo that exception when the mouse watchdog reasserts topmost.
+        let new_ex = if dock_popup_focused {
+            (ex | WS_EX_TOOLWINDOW.0 as usize) & !(WS_EX_NOACTIVATE.0 as usize)
+        } else {
+            ex | WS_EX_NOACTIVATE.0 as usize | WS_EX_TOOLWINDOW.0 as usize
+        };
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex as isize);
     }
 }
