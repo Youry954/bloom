@@ -6,6 +6,7 @@ on:
       - essai-notches-sans-bandes
       - correctif-recherche-ajout-dock
       - bloom-3-recherche-tray-chatgpt
+      - fix-tray-chevron-fallback
       - test/bloom-3-tray-arrow-fix
     paths:
       - ".github/workflows/build-preview.yml"
@@ -75,7 +76,7 @@ jobs:
       - name: Archiver uniquement l'application de test
         uses: actions/upload-artifact@v4
         with:
-          name: Bloom-3-Tray-Fix-Windows-${{ github.sha }}
+          name: Bloom-3-Preview-Windows
           path: src-tauri/target/release/bloom.exe
           if-no-files-found: error
           retention-days: 7

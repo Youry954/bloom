@@ -247,10 +247,43 @@ pub fn enumerate() -> Vec<TrayApp> {
     }
 }
 
+unsafe fn legacy_overflow_button_count() -> usize {
+    use windows::Win32::Foundation::WPARAM;
+    let Ok(hwnd) = FindWindowW(w!("NotifyIconOverflowWindow"), PCWSTR::null()) else {
+        return 0;
+    };
+    let Ok(toolbar) = FindWindowExW(Some(hwnd), None, w!("ToolbarWindow32"), PCWSTR::null())
+    else {
+        return 0;
+    };
+    let mut count = 0usize;
+    if SendMessageTimeoutW(
+        toolbar,
+        WM_USER + 24,
+        WPARAM(0),
+        LPARAM(0),
+        SMTO_ABORTIFHUNG,
+        1000,
+        Some(&mut count),
+    )
+    .0 == 0
+    {
+        return 0;
+    }
+    count
+}
+
 /// Windows 11 21H2 (and the classic tray) has no NotifyIconSettings catalog.
 /// Its empty discovery result does not mean that no background apps are running.
+/// Also fall back to the classic overflow if NotifyIconSettings yields no live
+/// icons while Explorer's classic NotifyIconOverflowWindow has toolbar buttons.
 pub fn uses_legacy_overflow() -> bool {
-    unsafe { open_key(HKEY_CURRENT_USER, "Control Panel\\NotifyIconSettings").is_none() }
+    unsafe {
+        if open_key(HKEY_CURRENT_USER, "Control Panel\\NotifyIconSettings").is_none() {
+            return true;
+        }
+        enumerate().is_empty() && legacy_overflow_button_count() > 0
+    }
 }
 
 fn overflow_position(anchor: POINT, width: i32, height: i32, area: RECT) -> (i32, i32) {
@@ -260,10 +293,40 @@ fn overflow_position(anchor: POINT, width: i32, height: i32, area: RECT) -> (i32
     )
 }
 
+fn legacy_overflow_dimensions(
+    win_rect: RECT,
+    tb_rect: RECT,
+    btn_size: usize,
+    rows: usize,
+) -> ((i32, i32), (i32, i32)) {
+    let orig_w = (win_rect.right - win_rect.left).max(1);
+    let orig_h = (win_rect.bottom - win_rect.top).max(1);
+    let orig_tb_w = (tb_rect.right - tb_rect.left).max(1);
+    let orig_tb_h = (tb_rect.bottom - tb_rect.top).max(1);
+    let pad_w = (orig_w - orig_tb_w).max(0);
+    let pad_h = (orig_h - orig_tb_h).max(0);
+    let btn_w = (btn_size & 0xFFFF) as i32;
+    let btn_h = ((btn_size >> 16) & 0xFFFF) as i32;
+    let rows = rows as i32;
+    let tb_w = if btn_w > 0 {
+        orig_tb_w.max(btn_w)
+    } else {
+        orig_tb_w
+    };
+    let tb_h = if btn_h > 0 && rows > 0 {
+        orig_tb_h.max(rows * btn_h)
+    } else {
+        orig_tb_h
+    };
+    ((tb_w + pad_w, tb_h + pad_h), (tb_w, tb_h))
+}
+
 /// Own only the classic popup, never the taskbar, AppBars or icon preferences.
 struct LegacyOverflow {
     hwnd: HWND,
+    toolbar: HWND,
     rect: RECT,
+    toolbar_rect: RECT,
     was_visible: bool,
     was_topmost: bool,
 }
@@ -271,18 +334,33 @@ struct LegacyOverflow {
 impl Drop for LegacyOverflow {
     fn drop(&mut self) {
         unsafe {
+            if IsWindow(Some(self.toolbar)).as_bool() {
+                let _ = SetWindowPos(
+                    self.toolbar,
+                    None,
+                    0,
+                    0,
+                    (self.toolbar_rect.right - self.toolbar_rect.left).max(1),
+                    (self.toolbar_rect.bottom - self.toolbar_rect.top).max(1),
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
             if IsWindow(Some(self.hwnd)).as_bool() {
                 if !self.was_visible {
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
                 }
                 let _ = SetWindowPos(
                     self.hwnd,
-                    Some(if self.was_topmost { HWND_TOPMOST } else { HWND_NOTOPMOST }),
+                    Some(if self.was_topmost {
+                        HWND_TOPMOST
+                    } else {
+                        HWND_NOTOPMOST
+                    }),
                     self.rect.left,
                     self.rect.top,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOACTIVATE,
+                    (self.rect.right - self.rect.left).max(1),
+                    (self.rect.bottom - self.rect.top).max(1),
+                    SWP_NOACTIVATE,
                 );
             }
         }
@@ -298,7 +376,9 @@ pub fn show_legacy_overflow() -> Result<(), String> {
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,
+    };
 
     unsafe {
         if crate::state::SHUTTING_DOWN.load(Ordering::Relaxed) {
@@ -310,7 +390,17 @@ pub fn show_legacy_overflow() -> Result<(), String> {
             .map_err(|_| "Cette version du panneau Windows n’est pas prise en charge.")?;
         // TB_BUTTONCOUNT (WM_USER + 24), bounded if Explorer is not responding.
         let mut count = 0usize;
-        if SendMessageTimeoutW(toolbar, WM_USER + 24, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 1000, Some(&mut count)).0 == 0 {
+        if SendMessageTimeoutW(
+            toolbar,
+            WM_USER + 24,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            1000,
+            Some(&mut count),
+        )
+        .0 == 0
+        {
             return Err("Le panneau des icônes Windows ne répond pas.".into());
         }
         if count == 0 {
@@ -318,41 +408,129 @@ pub fn show_legacy_overflow() -> Result<(), String> {
         }
         let mut rect = RECT::default();
         GetWindowRect(hwnd, &mut rect).map_err(|e| e.to_string())?;
+        let mut toolbar_rect = rect;
+        let _ = GetWindowRect(toolbar, &mut toolbar_rect);
+        // TB_GETBUTTONSIZE (WM_USER + 58) and TB_GETROWS (WM_USER + 40) expose
+        // the full wrapped button grid even before Explorer's own chevron
+        // resizes NotifyIconOverflowWindow.
+        let mut btn_size = 0usize;
+        let _ = SendMessageTimeoutW(
+            toolbar,
+            WM_USER + 58,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            1000,
+            Some(&mut btn_size),
+        );
+        let mut rows = 0usize;
+        let _ = SendMessageTimeoutW(
+            toolbar,
+            WM_USER + 40,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            1000,
+            Some(&mut rows),
+        );
+        let ((width, height), (tb_w, tb_h)) =
+            legacy_overflow_dimensions(rect, toolbar_rect, btn_size, rows);
         let mut anchor = POINT::default();
         GetCursorPos(&mut anchor).map_err(|e| e.to_string())?;
-        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        if !GetMonitorInfoW(MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST), &mut info).as_bool()
+        {
             return Err("Impossible de positionner le panneau Windows sur cet écran.".into());
         }
         if crate::state::TRAY_INTERACTION_ACTIVE.swap(true, Ordering::SeqCst) {
             return Err("Un menu de notification est déjà ouvert.".into());
         }
         let _guard = LegacyOverflow {
-            hwnd, rect,
+            hwnd,
+            toolbar,
+            rect,
+            toolbar_rect,
             was_visible: IsWindowVisible(hwnd).as_bool(),
             was_topmost: GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0,
         };
-        let (x, y) = overflow_position(anchor, rect.right - rect.left, rect.bottom - rect.top, info.rcMonitor);
-        SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
-            .map_err(|e| e.to_string())?;
+        let (x, y) = overflow_position(anchor, width, height, info.rcMonitor);
+        let _ = SetWindowPos(
+            toolbar,
+            None,
+            0,
+            0,
+            tb_w,
+            tb_h,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = SetWindowPos(
+            toolbar,
+            None,
+            0,
+            0,
+            tb_w,
+            tb_h,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         let _ = SetForegroundWindow(hwnd);
         // Explorer normally dismisses itself. Also handle outside presses when
         // Windows denies focus to the non-activating dock, and Escape reliably.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let down = || GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0;
+        let down = || {
+            GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0
+        };
         let mut was_down = down();
+        let mut menu_was_open = false;
         while std::time::Instant::now() < deadline
-            && IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool()
+            && IsWindow(Some(hwnd)).as_bool()
+            && IsWindowVisible(hwnd).as_bool()
             && !crate::state::SHUTTING_DOWN.load(Ordering::Relaxed)
             && crate::utils::dock_enabled()
         {
-            if GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 { break; }
-            let pressed = down();
-            if pressed && !was_down {
+            if GetAsyncKeyState(VK_ESCAPE.0 as i32) < 0 {
+                break;
+            }
+            let menu_open = FindWindowW(w!("#32768"), PCWSTR::null())
+                .is_ok_and(|menu| IsWindowVisible(menu).as_bool());
+            if menu_open {
+                menu_was_open = true;
+            } else if menu_was_open {
                 let mut point = POINT::default();
                 let mut bounds = RECT::default();
-                if GetCursorPos(&mut point).is_ok() && GetWindowRect(hwnd, &mut bounds).is_ok()
-                    && (point.x < bounds.left || point.x >= bounds.right || point.y < bounds.top || point.y >= bounds.bottom)
+                if GetCursorPos(&mut point).is_ok()
+                    && GetWindowRect(hwnd, &mut bounds).is_ok()
+                    && (point.x < bounds.left
+                        || point.x >= bounds.right
+                        || point.y < bounds.top
+                        || point.y >= bounds.bottom)
+                {
+                    break;
+                }
+                menu_was_open = false;
+            }
+            let pressed = down();
+            if pressed && !was_down && !menu_open {
+                let mut point = POINT::default();
+                let mut bounds = RECT::default();
+                if GetCursorPos(&mut point).is_ok()
+                    && GetWindowRect(hwnd, &mut bounds).is_ok()
+                    && (point.x < bounds.left
+                        || point.x >= bounds.right
+                        || point.y < bounds.top
+                        || point.y >= bounds.bottom)
                 {
                     break;
                 }
@@ -360,6 +538,14 @@ pub fn show_legacy_overflow() -> Result<(), String> {
             was_down = pressed;
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        if !_guard.was_visible && IsWindow(Some(hwnd)).as_bool() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        let release_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while down() && std::time::Instant::now() < release_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
         Ok(())
     }
 }
@@ -932,6 +1118,26 @@ mod tests {
         assert_eq!(overflow_position(POINT { x: 400, y: 550 }, 900, 700, monitor), (0, 0));
         let scaled = RECT { left: 1920, top: -200, right: 4480, bottom: 1240 };
         assert_eq!(overflow_position(POINT { x: 4400, y: 1200 }, 450, 300, scaled), (4030, 888));
+    }
+
+    #[test]
+    fn legacy_overflow_expands_height_for_wrapped_button_rows() {
+        let win = RECT { left: 1530, top: 810, right: 1710, bottom: 990 };
+        let tb = RECT { left: 1530, top: 810, right: 1710, bottom: 990 };
+        let btn_60x60 = (60usize << 16) | 60usize;
+        assert_eq!(
+            legacy_overflow_dimensions(win, tb, btn_60x60, 4),
+            ((180, 240), (180, 240))
+        );
+        let bordered = RECT { left: 1528, top: 808, right: 1712, bottom: 992 };
+        assert_eq!(
+            legacy_overflow_dimensions(bordered, tb, btn_60x60, 4),
+            ((184, 244), (180, 240))
+        );
+        assert_eq!(
+            legacy_overflow_dimensions(win, tb, 0, 0),
+            ((180, 180), (180, 180))
+        );
     }
 
     #[test]
