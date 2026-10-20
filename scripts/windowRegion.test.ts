@@ -124,7 +124,7 @@ describe("window region", () => {
 	});
 
 	test("computes expanded dock region and untransformed popup box for elastic animations", () => {
-		expect(DOCK_MAXIMIZED_GAP_PX).toBe(4);
+		expect(DOCK_MAXIMIZED_GAP_PX).toBe(0);
 		const normal = computeDockBarRect({
 			windowWidth: 1920,
 			windowHeight: 500,
@@ -140,14 +140,14 @@ describe("window region", () => {
 		const expanded = computeDockBarRect({
 			windowWidth: 1920,
 			windowHeight: 500,
-			dockRect: { x: 624, y: 448, width: 672, height: 52 },
+			dockRect: { x: 0, y: 448, width: 1920, height: 52 },
 			isVisible: true,
 			isExpanded: true,
 			isHidden: false,
 			isDockedExpanded: true,
 			adaptiveWidth: false
 		});
-		expect(expanded).toEqual([{ x: 608, y: 432, width: 704, height: 84 }]);
+		expect(expanded).toEqual([{ x: 0, y: 432, width: 1920, height: 84 }]);
 
 		// A popup mid-animation at scaleX=0.3, scaleY=0.1 still covers its full 380x320 target box
 		const popupRect = untransformedPopupBox(

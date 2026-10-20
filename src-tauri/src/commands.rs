@@ -4197,6 +4197,17 @@ pub enum SystemAction {
     NetworkConnections,
     TaskView,
     Search,
+    Shutdown,
+    Restart,
+    Sleep,
+    Lock,
+}
+
+#[tauri::command]
+pub fn get_current_user() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "Utilisateur".to_string())
 }
 
 #[tauri::command]
@@ -4276,6 +4287,16 @@ pub async fn open_system_action(action: SystemAction) -> Result<(), String> {
             ),
             // Search is handled above through the native Win+S shortcut.
             SystemAction::Search => unreachable!(),
+            SystemAction::Shutdown => (format!("{system}\\shutdown.exe"), "/s /t 0".into()),
+            SystemAction::Restart => (format!("{system}\\shutdown.exe"), "/r /t 0".into()),
+            SystemAction::Sleep => (
+                format!("{system}\\rundll32.exe"),
+                "powrprof.dll,SetSuspendState 0,1,0".into(),
+            ),
+            SystemAction::Lock => (
+                format!("{system}\\rundll32.exe"),
+                "user32.dll,LockWorkStation".into(),
+            ),
         };
         let file: Vec<u16> = file.encode_utf16().chain(Some(0)).collect();
         let args: Vec<u16> = args.encode_utf16().chain(Some(0)).collect();

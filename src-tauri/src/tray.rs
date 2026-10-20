@@ -16,6 +16,8 @@ pub struct TrayApp {
     pub path: String,
     pub tray_ids: Vec<String>,
     pub window_handles: Vec<isize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 struct Key(HKEY);
@@ -217,6 +219,174 @@ unsafe fn live_icons(windows: &[(isize, String)], include_own: bool) -> Vec<Icon
     result
 }
 
+unsafe fn toolbar_icons_from_hwnd(
+    toolbar: HWND,
+    own_path: Option<&str>,
+    include_own: bool,
+) -> Vec<(String, String, isize, Option<String>)> {
+    use windows::Win32::Foundation::{CloseHandle, WPARAM};
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows::Win32::System::Memory::{
+        VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ};
+
+    let mut count = 0usize;
+    if SendMessageTimeoutW(
+        toolbar,
+        WM_USER + 24, // TB_BUTTONCOUNT
+        WPARAM(0),
+        LPARAM(0),
+        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        250,
+        Some(&mut count),
+    )
+    .0 == 0
+        || count == 0
+        || count > 128
+    {
+        return vec![];
+    }
+
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(toolbar, Some(&mut pid));
+    if pid == 0 {
+        return vec![];
+    }
+    let Ok(proc) = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ, false, pid) else {
+        return vec![];
+    };
+    let remote = VirtualAllocEx(
+        proc,
+        None,
+        64,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
+    if remote.is_null() {
+        let _ = CloseHandle(proc);
+        return vec![];
+    }
+
+    let mut results = Vec::new();
+    for i in 0..count {
+        let mut ok = 0usize;
+        if SendMessageTimeoutW(
+            toolbar,
+            WM_USER + 23, // TB_GETBUTTON
+            WPARAM(i),
+            LPARAM(remote as isize),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            250,
+            Some(&mut ok),
+        )
+        .0 == 0
+            || ok == 0
+        {
+            continue;
+        }
+        let mut btn = [0u8; 32];
+        let mut read = 0usize;
+        if ReadProcessMemory(
+            proc,
+            remote,
+            btn.as_mut_ptr() as *mut _,
+            32,
+            Some(&mut read),
+        )
+        .is_err()
+            || read < 24
+        {
+            continue;
+        }
+        let fs_state = btn[8];
+        if (fs_state & 0x08) != 0 {
+            // TBSTATE_HIDDEN
+            continue;
+        }
+        let dw_data = u64::from_le_bytes(btn[16..24].try_into().unwrap_or([0; 8])) as usize;
+        if dw_data == 0 {
+            continue;
+        }
+        let mut td = [0u8; 32];
+        let mut read_td = 0usize;
+        if ReadProcessMemory(
+            proc,
+            dw_data as *const _,
+            td.as_mut_ptr() as *mut _,
+            32,
+            Some(&mut read_td),
+        )
+        .is_err()
+            || read_td < 32
+        {
+            continue;
+        }
+        let hwnd_val = isize::from_le_bytes(td[0..8].try_into().unwrap_or([0; 8]));
+        let uid = u32::from_le_bytes(td[8..12].try_into().unwrap_or([0; 4]));
+        let callback_msg = u32::from_le_bytes(td[12..16].try_into().unwrap_or([0; 4]));
+        let version = u32::from_le_bytes(td[20..24].try_into().unwrap_or([0; 4]));
+        let h_icon = isize::from_le_bytes(td[24..32].try_into().unwrap_or([0; 8]));
+
+        let owner_hwnd = HWND(hwnd_val as *mut _);
+        if hwnd_val == 0 || !IsWindow(Some(owner_hwnd)).as_bool() {
+            continue;
+        }
+        let mut owner_pid = 0u32;
+        GetWindowThreadProcessId(owner_hwnd, Some(&mut owner_pid));
+        let Some(path) = crate::commands::process_image_path(owner_pid) else {
+            continue;
+        };
+        if !include_own && own_path == Some(path.to_lowercase().as_str()) {
+            continue;
+        }
+        let icon_b64 = if h_icon != 0 {
+            crate::utils::icon_to_base64(HICON(h_icon as *mut _))
+        } else {
+            None
+        };
+        let key = format!("tb:{}:{}:{}:{}", hwnd_val, uid, callback_msg, version);
+        results.push((key, path, hwnd_val, icon_b64));
+    }
+
+    let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+    let _ = CloseHandle(proc);
+    results
+}
+
+unsafe fn toolbar_icons(include_own: bool) -> Vec<(String, String, isize, Option<String>)> {
+    let own_path = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().to_lowercase());
+    let mut all = Vec::new();
+
+    if let Ok(overflow) = FindWindowW(w!("NotifyIconOverflowWindow"), PCWSTR::null()) {
+        if let Ok(tb) = FindWindowExW(Some(overflow), None, w!("ToolbarWindow32"), PCWSTR::null()) {
+            all.extend(toolbar_icons_from_hwnd(
+                tb,
+                own_path.as_deref(),
+                include_own,
+            ));
+        }
+    }
+    if let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) {
+        if let Ok(notify) = FindWindowExW(Some(tray), None, w!("TrayNotifyWnd"), PCWSTR::null()) {
+            if let Ok(pager) = FindWindowExW(Some(notify), None, w!("SysPager"), PCWSTR::null()) {
+                if let Ok(tb) =
+                    FindWindowExW(Some(pager), None, w!("ToolbarWindow32"), PCWSTR::null())
+                {
+                    all.extend(toolbar_icons_from_hwnd(
+                        tb,
+                        own_path.as_deref(),
+                        include_own,
+                    ));
+                }
+            }
+        }
+    }
+    all
+}
+
 pub fn enumerate() -> Vec<TrayApp> {
     unsafe {
         let windows = process_windows();
@@ -238,9 +408,48 @@ pub fn enumerate() -> Vec<TrayApp> {
                         .collect(),
                     path: icon.path,
                     tray_ids: vec![],
+                    icon: None,
                 });
             app.tray_ids.push(icon.key);
         }
+
+        // Also inspect live ToolbarWindow32 notification buttons (NotifyIconOverflowWindow
+        // and SysPager) so systems without Win11 22H2+ NotifyIconSettings registry keys
+        // still enumerate all active background tray icons and their live HICON bitmaps.
+        for (tb_key, tb_path, tb_hwnd, tb_icon) in toolbar_icons(false) {
+            if is_explorer_hosted_icon(&tb_path) {
+                continue;
+            }
+            let key_lower = tb_path.to_lowercase();
+            if let Some(existing) = apps.get_mut(&key_lower) {
+                if existing.icon.is_none() && tb_icon.is_some() {
+                    existing.icon = tb_icon;
+                }
+                if !existing.window_handles.contains(&tb_hwnd) {
+                    existing.window_handles.push(tb_hwnd);
+                }
+            } else {
+                let mut handles: Vec<isize> = windows
+                    .iter()
+                    .filter(|(_, p)| p.eq_ignore_ascii_case(&tb_path))
+                    .map(|(h, _)| *h)
+                    .collect();
+                if !handles.contains(&tb_hwnd) {
+                    handles.push(tb_hwnd);
+                }
+                apps.insert(
+                    key_lower,
+                    TrayApp {
+                        name: crate::commands::app_display_name(&tb_path, None),
+                        window_handles: handles,
+                        path: tb_path,
+                        tray_ids: vec![tb_key],
+                        icon: tb_icon,
+                    },
+                );
+            }
+        }
+
         let mut apps: Vec<_> = apps.into_values().collect();
         apps.sort_by(|a, b| a.path.cmp(&b.path));
         apps
@@ -1096,6 +1305,71 @@ unsafe fn wait_for_menu_close(menu: HWND) {
 
 pub fn interact(key: &str, context_menu: bool) -> Result<(), String> {
     unsafe {
+        if let Some(rest) = key.strip_prefix("tb:") {
+            use windows::Win32::Foundation::WPARAM;
+            let parts: Vec<&str> = rest.split(':').collect();
+            if parts.len() == 4 {
+                if let (Ok(hwnd_val), Ok(uid), Ok(callback_msg), Ok(version)) = (
+                    parts[0].parse::<isize>(),
+                    parts[1].parse::<u32>(),
+                    parts[2].parse::<u32>(),
+                    parts[3].parse::<u32>(),
+                ) {
+                    let hwnd = HWND(hwnd_val as *mut _);
+                    if !IsWindow(Some(hwnd)).as_bool() {
+                        return Err("This tray icon is no longer running.".to_string());
+                    }
+                    let mut cursor = POINT::default();
+                    let _ = GetCursorPos(&mut cursor);
+                    let mut owner_pid = 0u32;
+                    GetWindowThreadProcessId(hwnd, Some(&mut owner_pid));
+                    let path = crate::commands::process_image_path(owner_pid).unwrap_or_default();
+                    let before = if context_menu {
+                        visible_windows()
+                    } else {
+                        HashMap::new()
+                    };
+                    let _ = SetForegroundWindow(hwnd);
+                    let packed_pt = ((cursor.x as u16 as usize)
+                        | ((cursor.y as u16 as usize) << 16))
+                        as usize;
+                    let send_ev = |ev: u32| {
+                        if version >= 4 {
+                            let lp = ((ev as usize & 0xFFFF)
+                                | (((uid as usize) & 0xFFFF) << 16))
+                                as isize;
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                callback_msg,
+                                WPARAM(packed_pt),
+                                LPARAM(lp),
+                            );
+                        } else {
+                            let _ = PostMessageW(
+                                Some(hwnd),
+                                callback_msg,
+                                WPARAM(uid as usize),
+                                LPARAM(ev as isize),
+                            );
+                        }
+                    };
+                    if context_menu {
+                        send_ev(WM_RBUTTONDOWN);
+                        send_ev(WM_RBUTTONUP);
+                        send_ev(WM_CONTEXTMENU);
+                        let menu = move_new_menu_to(&path, &before, cursor);
+                        if let Some(menu) = menu {
+                            wait_for_menu_close(menu);
+                        }
+                    } else {
+                        send_ev(WM_LBUTTONDOWN);
+                        send_ev(WM_LBUTTONUP);
+                        send_ev(NIN_SELECT);
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let _com = ComApartment::new()?;
         let windows = process_windows();
         let icons = live_icons(&windows, true);

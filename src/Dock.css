@@ -198,14 +198,14 @@ body {
 
 .dock {
 	display: flex;
-	flex-direction: row;
-	align-items: center;
-	justify-content: center;
-	gap: 12px;
+	flex-direction: column;
+	align-items: stretch;
+	justify-content: flex-end;
+	gap: 0;
 	padding: 8px 8px;
 	border-radius: 18px 18px 0 0;
 	/* Painted by the .edge-surface child (see components/EdgeSurface.css). */
-	--surface-bg: var(--bloom-bg, rgba(0, 0, 0, 0.8));
+	--surface-bg: var(--bloom-bg, rgba(0, 0, 0, 0.85));
 	isolation: isolate;
 	border: none;
 	color: var(--bloom-text, white);
@@ -213,6 +213,7 @@ body {
 	z-index: 2;
 	transform-origin: bottom center;
 	pointer-events: auto;
+	box-sizing: border-box;
 	transition: box-shadow 0.3s cubic-bezier(0.32, 0.72, 0, 1);
 	overflow: visible;
 	/* Re-enable pointer events for the dock itself */
@@ -222,16 +223,36 @@ body {
 	padding: 8px 14px;
 }
 
-.dock.dock-maximized-expanded {
-	padding: 8px 28px;
+.dock.dock-maximized-expanded,
+.dock.dock-fullwidth {
+	padding: 8px 20px;
+	border-radius: 0 !important;
+	margin: 0 !important;
+	--surface-bg: var(--bloom-bg-expanded, rgba(12, 13, 16, 0.98));
+}
+
+.dock.dock-island-open {
+	--surface-bg: var(--bloom-bg-expanded, rgba(14, 15, 20, 0.96));
+	box-shadow:
+		0 -16px 48px rgba(0, 0, 0, 0.55),
+		inset 0 1px 0 rgba(255, 255, 255, 0.12);
 }
 
 .dock-reorder-container {
 	display: flex;
 	flex-direction: row;
 	align-items: center;
+	justify-content: center;
 	gap: 12px;
+	min-height: 36px;
+	flex-shrink: 0;
 	overflow: visible;
+}
+
+.dock-reorder-container.dock-bar-with-island {
+	padding-top: 8px;
+	margin-top: 4px;
+	border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .dock-reorder-group {
@@ -498,7 +519,11 @@ body {
 	background: color-mix(in srgb, var(--bloom-text, white) 18%, transparent);
 	border-color: color-mix(in srgb, var(--bloom-text, white) 32%, transparent);
 }
-.dock-search-pill:active, .dock-tray-toggle:active { transform: scale(0.96); }
+.dock-search-pill:active,
+.dock-tray-toggle:active,
+.dock-start-btn:active {
+	transform: none !important;
+}
 .dock-search-pill:focus-visible, .dock-tray-toggle:focus-visible,
 .tray-overflow-popup button:focus-visible {
 	outline: 2px solid var(--bloom-accent, #5999fd);
@@ -1045,11 +1070,14 @@ body {
 }
 
 .dock-start-btn:hover,
+.dock-start-btn.is-open,
 .dock-icon-only .dock-icon.dock-start-btn:hover,
+.dock-icon-only .dock-icon.dock-start-btn.is-open,
 .dock-search-pill:hover,
 .dock-search-pill.is-open,
 .dock-tray-toggle:hover,
 .dock-tray-toggle.is-open {
+	transform: none !important;
 	background: linear-gradient(
 		135deg,
 		color-mix(in srgb, var(--bloom-accent, #5b9bff) 22%, color-mix(in srgb, var(--bloom-text, white) 18%, transparent)) 0%,
@@ -1060,6 +1088,422 @@ body {
 		inset 0 1px 0 rgba(255, 255, 255, 0.24),
 		0 6px 16px rgba(0, 0, 0, 0.2),
 		0 0 14px color-mix(in srgb, var(--bloom-accent, #5b9bff) 24%, transparent);
+}
+
+/* Integrated Dynamic Island Panels inside the stretched Dock */
+.dock-island-panel {
+	flex: 1;
+	min-height: 0;
+	width: 100%;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	box-sizing: border-box;
+	padding: 8px 6px 4px;
+	color: var(--bloom-text, white);
+	pointer-events: auto;
+}
+
+/* Start Menu inside the stretched Dock */
+.start-search-bar {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin: 4px 6px 10px;
+	padding: 10px 14px;
+	border-radius: 999px;
+	background: color-mix(in srgb, var(--bloom-text, white) 8%, transparent);
+	border: 1px solid color-mix(in srgb, var(--bloom-accent, #5b9bff) 32%, color-mix(in srgb, var(--bloom-text, white) 14%, transparent));
+	box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+	flex-shrink: 0;
+}
+
+.start-search-clear {
+	background: color-mix(in srgb, var(--bloom-text, white) 12%, transparent);
+	border: none;
+	color: var(--bloom-text, white);
+	font-size: 11px;
+	padding: 3px 8px;
+	border-radius: 999px;
+	cursor: pointer;
+}
+
+.start-section-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 2px 12px 8px;
+	flex-shrink: 0;
+}
+
+.start-section-title {
+	font-size: 12.5px;
+	font-weight: 650;
+	letter-spacing: -0.01em;
+	color: var(--bloom-text, white);
+}
+
+.start-all-apps-btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	padding: 5px 10px;
+	border-radius: 8px;
+	border: 1px solid color-mix(in srgb, var(--bloom-text, white) 14%, transparent);
+	background: color-mix(in srgb, var(--bloom-text, white) 7%, transparent);
+	color: var(--bloom-text, white);
+	font: inherit;
+	font-size: 11.5px;
+	font-weight: 550;
+	cursor: pointer;
+	transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.start-all-apps-btn:hover {
+	background: color-mix(in srgb, var(--bloom-text, white) 14%, transparent);
+	border-color: color-mix(in srgb, var(--bloom-text, white) 26%, transparent);
+}
+
+.start-body-scroll {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	padding: 2px 8px 6px;
+}
+
+.start-body-scroll::-webkit-scrollbar,
+.tray-grid-scroll::-webkit-scrollbar {
+	width: 4px;
+}
+
+.start-body-scroll::-webkit-scrollbar-thumb,
+.tray-grid-scroll::-webkit-scrollbar-thumb {
+	background: rgba(255, 255, 255, 0.14);
+	border-radius: 2px;
+}
+
+.start-pinned-grid {
+	display: grid;
+	grid-template-columns: repeat(6, minmax(0, 1fr));
+	gap: 8px 6px;
+	padding: 4px 2px;
+}
+
+.start-grid-item {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: flex-start;
+	gap: 6px;
+	padding: 10px 6px 8px;
+	border-radius: 12px;
+	border: 1px solid transparent;
+	background: transparent;
+	color: var(--bloom-text, white);
+	font: inherit;
+	cursor: pointer;
+	transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.start-grid-item:hover {
+	background: color-mix(in srgb, var(--bloom-text, white) 9%, transparent);
+	border-color: color-mix(in srgb, var(--bloom-text, white) 14%, transparent);
+}
+
+.start-grid-icon {
+	width: 36px;
+	height: 36px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 10px;
+}
+
+.start-grid-icon img {
+	width: 32px;
+	height: 32px;
+	object-fit: contain;
+}
+
+.start-grid-initial {
+	width: 32px;
+	height: 32px;
+	border-radius: 9px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-size: 14px;
+	font-weight: 650;
+	background: color-mix(in srgb, var(--bloom-text, white) 12%, transparent);
+}
+
+.start-grid-name {
+	font-size: 11.5px;
+	font-weight: 500;
+	text-align: center;
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	opacity: 0.92;
+}
+
+.start-alpha-list {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.start-alpha-group {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.start-alpha-letter {
+	font-size: 11px;
+	font-weight: 700;
+	color: var(--bloom-accent, #5b9bff);
+	padding: 6px 10px 2px;
+}
+
+.start-alpha-row {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 7px 10px;
+	border-radius: 10px;
+	border: none;
+	background: transparent;
+	color: var(--bloom-text, white);
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
+	transition: background 0.14s ease;
+}
+
+.start-alpha-row:hover {
+	background: color-mix(in srgb, var(--bloom-text, white) 10%, transparent);
+}
+
+.start-alpha-icon {
+	width: 28px;
+	height: 28px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+}
+
+.start-alpha-icon img {
+	width: 26px;
+	height: 26px;
+	object-fit: contain;
+}
+
+.start-alpha-name {
+	font-size: 13px;
+	font-weight: 500;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.start-footer-bar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 8px 12px 6px;
+	margin-top: 4px;
+	border-top: 1px solid rgba(255, 255, 255, 0.08);
+	flex-shrink: 0;
+}
+
+.start-user-badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 9px;
+	padding: 5px 10px 5px 6px;
+	border-radius: 10px;
+	border: 1px solid transparent;
+	background: transparent;
+	color: var(--bloom-text, white);
+	font: inherit;
+	cursor: pointer;
+	transition: background 0.15s ease;
+}
+
+.start-user-badge:hover {
+	background: color-mix(in srgb, var(--bloom-text, white) 9%, transparent);
+}
+
+.start-user-avatar {
+	width: 28px;
+	height: 28px;
+	border-radius: 50%;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: linear-gradient(135deg, var(--bloom-accent, #5b9bff), #3b82f6);
+	color: white;
+}
+
+.start-user-name {
+	font-size: 12.5px;
+	font-weight: 600;
+}
+
+.start-power-wrapper {
+	position: relative;
+	display: flex;
+	align-items: center;
+}
+
+.start-power-btn {
+	width: 34px;
+	height: 34px;
+	border-radius: 10px;
+	border: 1px solid color-mix(in srgb, var(--bloom-text, white) 14%, transparent);
+	background: color-mix(in srgb, var(--bloom-text, white) 7%, transparent);
+	color: var(--bloom-text, white);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.start-power-btn:hover,
+.start-power-btn.is-open {
+	background: color-mix(in srgb, var(--bloom-text, white) 15%, transparent);
+	border-color: color-mix(in srgb, var(--bloom-text, white) 28%, transparent);
+}
+
+.start-power-popover {
+	position: absolute;
+	right: 0;
+	bottom: calc(100% + 8px);
+	min-width: 165px;
+	padding: 6px;
+	border-radius: 12px;
+	background: rgba(22, 24, 30, 0.98);
+	border: 1px solid rgba(255, 255, 255, 0.14);
+	box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	z-index: 30;
+}
+
+.start-power-option {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	padding: 8px 10px;
+	border-radius: 8px;
+	border: none;
+	background: transparent;
+	color: var(--bloom-text, white);
+	font: inherit;
+	font-size: 12.5px;
+	font-weight: 500;
+	cursor: pointer;
+	text-align: left;
+	transition: background 0.14s ease;
+}
+
+.start-power-option:hover {
+	background: rgba(255, 255, 255, 0.1);
+}
+
+.start-power-option.start-power-danger:hover {
+	background: rgba(239, 68, 68, 0.25);
+	color: #fca5a5;
+}
+
+/* Integrated System Tray Grid inside the stretched Dock */
+.tray-grid-scroll {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	padding: 4px 10px 8px;
+}
+
+.tray-icon-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+	gap: 8px;
+}
+
+.tray-grid-card {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	padding: 12px 8px 10px;
+	border-radius: 12px;
+	background: color-mix(in srgb, var(--bloom-text, white) 6%, transparent);
+	border: 1px solid color-mix(in srgb, var(--bloom-text, white) 10%, transparent);
+	cursor: pointer;
+	transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.tray-grid-card:hover {
+	background: color-mix(in srgb, var(--bloom-text, white) 12%, transparent);
+	border-color: color-mix(in srgb, var(--bloom-accent, #5b9bff) 40%, transparent);
+}
+
+.tray-grid-icon-box {
+	width: 32px;
+	height: 32px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.tray-grid-icon-box img {
+	width: 28px;
+	height: 28px;
+	object-fit: contain;
+}
+
+.tray-grid-label {
+	font-size: 11px;
+	font-weight: 500;
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	opacity: 0.9;
+}
+
+.tray-grid-more {
+	position: absolute;
+	top: 4px;
+	right: 4px;
+	width: 22px;
+	height: 22px;
+	border-radius: 6px;
+	border: none;
+	background: transparent;
+	color: var(--bloom-text, white);
+	opacity: 0;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	transition: opacity 0.14s ease, background 0.14s ease;
+}
+
+.tray-grid-card:hover .tray-grid-more {
+	opacity: 0.8;
+}
+
+.tray-grid-more:hover {
+	opacity: 1 !important;
+	background: rgba(255, 255, 255, 0.16);
 }
 
 .dock-search-pill:focus-visible,

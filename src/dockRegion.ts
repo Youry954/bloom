@@ -24,11 +24,12 @@ export {
 	type RegionState
 };
 
-/** Exact 4px CSS gap maintained between maximized windows and the top edge of the Dock. */
-export const DOCK_MAXIMIZED_GAP_PX = 4;
+/** Exact 0px CSS gap maintained between maximized windows and the top edge of the Dock. */
+export const DOCK_MAXIMIZED_GAP_PX = 0;
 
-/** Selectors and shadow padding for all interactive Dock popups and elastic detach bubbles. */
+/** Selectors and shadow padding for all interactive Dock panels, popups, and context menus. */
 export const DOCK_POPUP_SELECTORS: [string, number][] = [
+	[".dock-island-panel", 18],
 	[".dock-search-popup", 18],
 	[".tray-overflow-popup", 16],
 	[".add-app-popup", 16],
@@ -90,14 +91,15 @@ export function computeDockBarRect(input: DockBarRegionInput): RegionRect[] {
 
 	const effectivePad = isDockedExpanded ? Math.max(dockPad, 16) : dockPad;
 
-	if (adaptiveWidth) {
+	if (isDockedExpanded || adaptiveWidth) {
 		const padded = padRect(dockRect, effectivePad);
+		const topY = Math.max(0, padded.y);
 		return [
 			{
 				x: 0,
-				y: padded.y,
+				y: topY,
 				width: windowWidth,
-				height: padded.height
+				height: Math.max(padded.height, windowHeight - topY)
 			}
 		];
 	}

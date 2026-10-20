@@ -163,6 +163,7 @@ fn main() {
             get_custom_icons,
             set_menu_open,
             set_dock_popup_focus,
+            get_current_user,
             focus_window,
             focus_app_windows,
             close_window,
