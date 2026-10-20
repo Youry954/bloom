@@ -6,6 +6,8 @@ on:
       - essai-notches-sans-bandes
       - correctif-recherche-ajout-dock
       - bloom-3-recherche-tray-chatgpt
+      - fix-tray-chevron-fallback
+      - test/bloom-3-tray-arrow-fix
     paths:
       - ".github/workflows/build-preview.yml"
       - "src-tauri/src/services.rs"
@@ -18,6 +20,8 @@ on:
       - "public/brand-clean-chatgpt.svg"
       - "src-tauri/src/tray.rs"
       - "src/Dock.css"
+      - "src/dockRegion.ts"
+      - "scripts/windowRegion.test.ts"
   workflow_dispatch:
 
 permissions:
@@ -39,6 +43,8 @@ jobs:
 
       - name: Installer Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Mettre le cache Rust en place
         uses: Swatinem/rust-cache@v2
@@ -50,6 +56,21 @@ jobs:
 
       - name: Vérifier la compilation du frontend
         run: bun run build
+
+      - name: Tester le dock et les régions des fenêtres
+        run: bun test ./scripts
+
+      - name: Vérifier Rust
+        run: cargo check --locked
+        working-directory: src-tauri
+
+      - name: Vérifier Clippy
+        run: cargo clippy --locked --all-targets
+        working-directory: src-tauri
+
+      - name: Tester Rust
+        run: cargo test --locked
+        working-directory: src-tauri
 
       - name: Construire Bloom sans installateur
         run: bun run tauri build --no-bundle --ci

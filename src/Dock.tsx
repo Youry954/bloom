@@ -2,7 +2,19 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, memo } from "rea
 import { motion, AnimatePresence, Reorder } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Search, ChevronUp, MoreHorizontal, RefreshCw } from "lucide-react";
+import {
+	Search,
+	ChevronUp,
+	ChevronRight,
+	ChevronLeft,
+	Power,
+	User,
+	Moon,
+	RotateCcw,
+	Lock,
+	MoreHorizontal,
+	RefreshCw
+} from "lucide-react";
 import "./Dock.css";
 import { EdgeSurface } from "./components/EdgeSurface";
 import { initTheme } from "./theme";
@@ -11,7 +23,14 @@ import { reloadIfMirrorWasStale } from "./hooks/settingsMirror";
 
 import { mergeTrayApps, selectDockTrayApps, type AppInfo, type TrayApp } from "./dockApps";
 import { driveLetter, hideDrive, removeCustomFolder, type DockExtra } from "./dockExtras";
-import { createRegionSender, measureElements, padRect, type RegionRect } from "./windowRegion";
+import {
+	computeDockBarRect,
+	createRegionSender,
+	measureDockPopups,
+	measureElements,
+	type RegionRect,
+	untransformedPopupBox
+} from "./dockRegion";
 
 // Host processes (Edge/Chrome/Brave/ApplicationFrameHost) run every PWA/UWP
 // window, so their window title must be part of their identity — otherwise two
@@ -74,11 +93,6 @@ export function isSameApp(a: AppInfo, b: AppInfo): boolean {
 	// Two opaque shell ids match only exactly (checked above).
 	if (aId && bId) return false;
 	if (aId !== bId) {
-		// One side is a shell id (AUMID), the other a file path. AUMIDs embed
-		// the product name (ZedIndustries.Zed, com.squirrel.Figma.Figma), so
-		// match on overlapping display names plus id/stem cross-containment.
-		// This is the common shape: installed entries come from the AppsFolder
-		// scan (AUMID) while pinned entries are exe/.lnk paths.
 		const fileSide = aId ? b : a;
 		const idLower = (aId ? a : b).path.toLowerCase();
 		const na = a.name.toLowerCase();
@@ -101,13 +115,8 @@ export function isSameApp(a: AppInfo, b: AppInfo): boolean {
 const fileOf = (p: string) =>
 	(p.split("/").pop()?.split("\\").pop()?.toLowerCase() || "").replace(/\.lnk$/, "");
 
-// Shell application ids (AUMIDs) identify one specific app; two different PWAs
-// running in the same browser must never be matched by their shared exe name.
 const isIdentifier = (p: string) => !p.includes("/") && !p.includes("\\");
 
-// Windows Store icons can contain an opaque blue/white plate baked into the
-// image itself. For these two known apps use clean transparent vector marks
-// instead of trying to cut pixels out of arbitrary user icons.
 function cleanBrandIcon(app: AppInfo): string | null {
 	const name = app.name.trim().toLowerCase();
 	const path = app.path.toLowerCase();
@@ -120,9 +129,6 @@ function cleanBrandIcon(app: AppInfo): string | null {
 	return null;
 }
 
-// Resolve the configured start-button icon to a public asset, or to the data
-// URI of a user-uploaded icon (stored with a "custom:" prefix).
-// Task View's glyph: a window in front of another, as on the taskbar.
 function TaskViewIcon() {
 	return (
 		<svg viewBox="0 0 24 24" fill="none" strokeWidth="1.8" strokeLinecap="round">
@@ -141,8 +147,6 @@ function resolveStartIcon(startIcon: string): string {
 	return "/bloom.png";
 }
 
-// Stable module-level constants so object references never change between renders,
-// preventing Framer Motion from re-triggering animations on every re-render.
 const ITEM_ENTRY_TRANSITION = {
 	opacity: { duration: 0.15, delay: 0.15 },
 	scale: { type: "spring" as const, stiffness: 400, damping: 25, delay: 0.15 }
@@ -150,6 +154,38 @@ const ITEM_ENTRY_TRANSITION = {
 const ITEM_INITIAL = { opacity: 0, scale: 0 };
 const ITEM_ANIMATE = { opacity: 1, scale: 1 };
 const ITEM_EXIT = { opacity: 0, scale: 0 };
+
+// Elastic "Detach / Stretch" physics for context menus and window previews.
+const DETACH_INITIAL = {
+	scaleX: 0.3,
+	scaleY: 0.1,
+	y: 24,
+	opacity: 0,
+	borderRadius: "32px"
+};
+const DETACH_ANIMATE = {
+	scaleX: 1,
+	scaleY: 1,
+	y: 0,
+	opacity: 1,
+	borderRadius: "16px"
+};
+const DETACH_EXIT = {
+	scaleX: 0.35,
+	scaleY: 0.12,
+	y: 20,
+	opacity: 0,
+	borderRadius: "28px",
+	transition: { duration: 0.14, ease: "easeIn" as const }
+};
+const DETACH_SPRING = {
+	type: "spring" as const,
+	stiffness: 380,
+	damping: 22,
+	mass: 0.8
+};
+
+type ActiveDockPanel = "start" | "search" | "tray" | "add" | null;
 
 // One dot per open window, capped at three.
 function WindowDots({ count, background }: { count: number; background?: boolean }) {
@@ -173,6 +209,8 @@ const Dock = memo(function Dock() {
 
 	const [pinnedApps, setPinnedApps] = useState<AppInfo[]>([]);
 	const [activeApps, setActiveApps] = useState<AppInfo[]>([]);
+	const [installedApps, setInstalledApps] = useState<AppInfo[]>([]);
+	const [currentUser, setCurrentUser] = useState("Utilisateur");
 	const iconsRef = useRef<Record<string, string>>({});
 	const [, setIconsTick] = useState(0);
 	const [dockMode, setDockMode] = useState(() => {
@@ -212,12 +250,13 @@ const Dock = memo(function Dock() {
 	const [isEdgeHovered, setIsEdgeHovered] = useState(false);
 	const [isOverlapped, setIsOverlapped] = useState(false);
 	const [isVisible, setIsVisible] = useState(true);
-	const [showAddPopup, setShowAddPopup] = useState(false);
-	const [showTrayPopup, setShowTrayPopup] = useState(false);
+	const [activePanel, setActivePanel] = useState<ActiveDockPanel>(null);
 	const [trayItems, setTrayItems] = useState<TrayApp[]>([]);
 	const [trayIcons, setTrayIcons] = useState<Record<string, string>>({});
 	const [trayLoading, setTrayLoading] = useState(false);
 	const [nativeMenuOpen, setNativeMenuOpen] = useState(false);
+	const [detachingId, setDetachingId] = useState<string | null>(null);
+	const detachTimerRef = useRef<any>(null);
 	const [contextMenu, setContextMenu] = useState<{
 		x: number;
 		y: number;
@@ -240,52 +279,52 @@ const Dock = memo(function Dock() {
 	const iconPickerTargetRef = useRef<string | null>(null);
 	const toastTimerRef = useRef<any>(null);
 	const dockRef = useRef<HTMLDivElement>(null);
-	const [popupBottom, setPopupBottom] = useState(56);
+	const barRowRef = useRef<HTMLDivElement>(null);
+	const islandPanelRef = useRef<HTMLDivElement>(null);
 	const pinnedItemsRef = useRef<AppInfo[]>([]);
 	const handleAppClickRef = useRef<(app: AppInfo) => void>(() => {});
 	const [scale, setScale] = useState(() =>
 		parseFloat(localStorage.getItem("bloom-scale") || "1.0")
 	);
 	const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+	const [viewportHeight, setViewportHeight] = useState(() => window.innerHeight);
 
 	useEffect(() => {
-		const onResize = () => setViewportWidth(window.innerWidth);
+		const onResize = () => {
+			setViewportWidth(window.innerWidth);
+			setViewportHeight(window.innerHeight);
+		};
 		window.addEventListener("resize", onResize);
 		return () => window.removeEventListener("resize", onResize);
 	}, []);
 
-	// Measure the dock pill when the popup opens; the card tucks ~14px
-	// behind the pill (which paints above it), so the seam stays fused even
-	// if the measurement is off by a few px at some scale.
+	// Enable real keyboard focus on the Dock window when a Dynamic Island panel with an input is open.
 	useEffect(() => {
-		if (showAddPopup) {
-			const h = dockRef.current?.getBoundingClientRect().height ?? 0;
-			if (h > 0) setPopupBottom(h / (scale || 1) - 14);
-		}
-	}, [showAddPopup, scale]);
-
-	// The dock normally uses a non-activating window, which is ideal for icons
-	// but prevents native keyboard input in the Add App search. Temporarily
-	// enable real focus while the popup exists and restore it on unmount.
-	useEffect(() => {
-		if (!showAddPopup) return;
+		const needsFocus = activePanel === "start" || activePanel === "search" || activePanel === "add";
+		if (!needsFocus) return;
 		let mounted = true;
 		invoke("set_dock_popup_focus", { active: true })
 			.then(() => {
 				if (mounted) {
-					document.querySelector<HTMLInputElement>(".popup-search-input")?.focus();
+					setTimeout(() => {
+						document.querySelector<HTMLInputElement>(".popup-search-input")?.focus();
+					}, 30);
 				}
 			})
-			.catch((error) => console.error("Could not focus Add App search:", error));
+			.catch((error) => console.error("Could not focus dock panel:", error));
 		return () => {
 			mounted = false;
 			invoke("set_dock_popup_focus", { active: false }).catch(() => {});
 		};
-	}, [showAddPopup]);
+	}, [activePanel]);
 
 	const isCurrentlyHovered = isDockHovered || isEdgeHovered;
 	const [interactionState, setInteractionState] = useState<"active" | "grace" | "none">("none");
-	const isAnyInteraction = isCurrentlyHovered || !!contextMenu || showAddPopup || showTrayPopup || nativeMenuOpen;
+	const isAnyInteraction =
+		isCurrentlyHovered ||
+		!!contextMenu ||
+		activePanel !== null ||
+		nativeMenuOpen;
 
 	const previewTimerRef = useRef<any>(null);
 	const isPreviewHoveredRef = useRef(false);
@@ -306,14 +345,18 @@ const Dock = memo(function Dock() {
 		((dockMode === "smart" && isOverlapped && interactionState === "none") ||
 			(dockMode === "peek" && interactionState === "none"));
 
-	// Adaptive mode (fixed dock only): stretch into a full-width taskbar while a
-	// standard maximized window is in the foreground, so the reserved strip no
-	// longer looks like a cut-out around the centered pill.
+	// 100% full-width taskbar with 0px gap when a window is maximized or occupies the work area.
+	const isDockedExpanded =
+		(isMaximized || (dockMode === "fixed" && isOverlapped)) &&
+		isExpanded &&
+		!isHidden &&
+		isVisible;
+
 	const isAdaptive =
 		dockAdaptive && dockMode === "fixed" && isMaximized && isExpanded && !isHidden && isVisible;
-	// Nearly full width — 24px margin per side at the visual (scaled) size.
-	// Pre-transform: visual = width * scale, so width = (viewport - 48*scale) / scale.
-	const adaptiveWidth = (viewportWidth - 48 * scale) / scale;
+
+	// Exact 100vw pre-scale width so visual width after `scale` transform is 100% of viewportWidth with 0px left/right gap.
+	const fullScreenWidth = Math.ceil(viewportWidth / (scale || 1));
 
 	useEffect(() => {
 		let cleared = false;
@@ -334,8 +377,6 @@ const Dock = memo(function Dock() {
 			return false;
 		};
 
-		// Keep polling until visible — no time cap, since the dock can be
-		// enabled at runtime from settings after any delay.
 		const interval = setInterval(async () => {
 			if (cleared) return;
 			if (await checkVisibility()) {
@@ -344,7 +385,6 @@ const Dock = memo(function Dock() {
 			}
 		}, 200);
 
-		// Also attempt immediately
 		checkVisibility().then((ok) => {
 			if (ok) {
 				clearInterval(interval);
@@ -379,11 +419,32 @@ const Dock = memo(function Dock() {
 		const observer = new ResizeObserver(updateRect);
 		if (dockRef.current) observer.observe(dockRef.current);
 
+		let rafId = 0;
+		const start = performance.now();
+		const tick = (now: number) => {
+			updateRect();
+			if (now - start < 520) {
+				rafId = requestAnimationFrame(tick);
+			}
+		};
+		rafId = requestAnimationFrame(tick);
+
 		return () => {
+			cancelAnimationFrame(rafId);
 			window.removeEventListener("resize", updateRect);
 			observer.disconnect();
 		};
-	}, [pinnedApps, activeApps, isHidden, previewData, scale]);
+	}, [
+		pinnedApps,
+		activeApps,
+		isHidden,
+		isExpanded,
+		isDockedExpanded,
+		isAdaptive,
+		activePanel,
+		previewData,
+		scale
+	]);
 
 	useEffect(() => {
 		const init = async () => {
@@ -429,11 +490,18 @@ const Dock = memo(function Dock() {
 			setPinnedApps(pinned.map((a) => ({ ...a, is_pinned: true })));
 			pinned.forEach((app) => fetchIcon(app.path));
 
-			// Warm the installed-apps cache in the background so the add-app
-			// popup opens with data ready instead of waiting on the scan.
-			invoke<AppInfo[]>("get_installed_apps").catch(() => {});
+			invoke<string>("get_current_user")
+				.then((u) => {
+					if (u) setCurrentUser(u);
+				})
+				.catch(() => {});
 
-			// Load custom icons
+			invoke<AppInfo[]>("get_installed_apps")
+				.then((apps) => {
+					setInstalledApps(apps.sort((a, b) => a.name.localeCompare(b.name)));
+				})
+				.catch(() => {});
+
 			try {
 				const icons = await invoke<Record<string, string>>("get_custom_icons");
 				setCustomIcons(icons);
@@ -441,16 +509,19 @@ const Dock = memo(function Dock() {
 		};
 		init();
 
-		// The installed-apps scan finishes after the first load; pins saved under
-		// their executable's name then get their Start menu name.
 		const unlistenInstalledApps = listen("installed-apps-updated", async () => {
 			try {
-				const refreshed = await invoke<AppInfo[]>("load_pinned_apps");
+				const [refreshed, allInstalled] = await Promise.all([
+					invoke<AppInfo[]>("load_pinned_apps"),
+					invoke<AppInfo[]>("get_installed_apps").catch(() => [] as AppInfo[])
+				]);
+				if (allInstalled.length > 0) {
+					setInstalledApps(allInstalled.sort((a, b) => a.name.localeCompare(b.name)));
+				}
 				const names = new Map(refreshed.map((a) => [a.path, a.name]));
 				setPinnedApps((prev) => {
 					const next = prev.map((a) => ({ ...a, name: names.get(a.path) ?? a.name }));
 					if (!next.some((a, i) => a.name !== prev[i].name)) return prev;
-					// Pins are otherwise saved only when they change; keep the names.
 					queueMicrotask(() => {
 						invoke("save_pinned_apps", { apps: next }).catch(console.error);
 					});
@@ -512,7 +583,6 @@ const Dock = memo(function Dock() {
 			const seq = ++loadSeq;
 			try {
 				const extras = await invoke<DockExtra[]>("get_dock_extras");
-				// A slow load must never overwrite a newer one that already landed.
 				if (!stopped && seq === loadSeq) setDockExtras(extras);
 			} catch (e) {
 				console.error("Failed to load dock extras:", e);
@@ -520,8 +590,6 @@ const Dock = memo(function Dock() {
 		};
 		load();
 
-		// Drives can be plugged in or removed at any time; converge like the
-		// window list does instead of trusting a one-shot fetch.
 		const interval = setInterval(load, 10000);
 		return () => {
 			stopped = true;
@@ -547,15 +615,14 @@ const Dock = memo(function Dock() {
 				console.error("Failed to refresh dock apps:", error);
 				return;
 			}
-			// Ignore responses that arrive out of order: an older poll must never
-			// overwrite a newer state, which would resurrect closed apps.
 			if (stopped || seq !== pollSeq) return;
+			setTrayItems(tray.filter((app) => app.tray_ids.length > 0));
 			const selected = selectDockTrayApps(windows, tray, observedTrayPathsRef.current, (app) =>
 				pinnedApps.some((pinned) =>
 					isSameApp(pinned, {
 						name: app.name,
 						path: app.path,
-						icon: null,
+						icon: app.icon ?? null,
 						is_running: true,
 						executable: fileOf(app.path)
 					})
@@ -584,7 +651,6 @@ const Dock = memo(function Dock() {
 			poll();
 		});
 
-		// Safety net: even if a window event is missed, converge on the real state
 		const interval = setInterval(poll, 10000);
 
 		return () => {
@@ -673,7 +739,6 @@ const Dock = memo(function Dock() {
 				delete next[app.path];
 				return next;
 			});
-			// Invalidate only this app's cached icon and re-fetch only this app
 			delete iconsRef.current[ck];
 			delete iconsRef.current[app.path];
 			if (app.hwnd) delete iconsRef.current[`${app.path}-${app.hwnd}`];
@@ -702,14 +767,20 @@ const Dock = memo(function Dock() {
 		}
 	};
 
+	const toggleDockPanel = (panel: Exclude<ActiveDockPanel, null>) => {
+		setContextMenu(null);
+		setActiveSubmenu(null);
+		setPreviewData(null);
+		setActivePanel((current) => (current === panel ? null : panel));
+	};
+
 	const handleAppClick = async (app: AppInfo) => {
 		try {
 			if (app.path === "start") {
-				await invoke("open_app", { appName: "start" });
+				toggleDockPanel("start");
 			} else if (app.is_background && app.tray_ids?.length === 1) {
 				await invoke("activate_tray_icon", { trayId: app.tray_ids[0] });
 			} else if (app.all_hwnds && app.all_hwnds.length > 1) {
-				// Several windows: bring the most recent forward, then cycle.
 				await invoke("focus_app_windows", { hwnds: app.all_hwnds.map(([hwnd]) => hwnd) });
 			} else if (app.hwnd) {
 				await invoke("focus_window", { hwnd: app.hwnd });
@@ -731,8 +802,6 @@ const Dock = memo(function Dock() {
 		}
 	};
 
-	// Middle-click opens a new instance, matching the native taskbar. The
-	// mousedown preventDefault suppresses Chromium's autoscroll cursor.
 	const handleMiddleClick = (e: React.MouseEvent, app: AppInfo) => {
 		if (e.button !== 1) return;
 		e.preventDefault();
@@ -745,8 +814,6 @@ const Dock = memo(function Dock() {
 		if (app.is_pinned) {
 			newPinned = pinnedApps.filter((a) => itemKey(a) !== itemKey(app));
 		} else {
-			// Fuzzy guard: the same app pinned via another entry shape (running
-			// window vs installed shortcut) must never create a duplicate.
 			if (pinnedApps.some((a) => isSameApp(a, app))) return;
 			newPinned = [...pinnedApps, { ...app, is_pinned: true, is_running: false, hwnd: undefined }];
 			fetchIcon(app.path, app.name);
@@ -757,8 +824,12 @@ const Dock = memo(function Dock() {
 	};
 
 	const menuRef = useRef<HTMLDivElement>(null);
-	const popupRef = useRef<HTMLDivElement>(null);
-	const trayPopupRef = useRef<HTMLDivElement>(null);
+
+	const triggerDetachEffect = (id: string) => {
+		if (detachTimerRef.current) clearTimeout(detachTimerRef.current);
+		setDetachingId(id);
+		detachTimerRef.current = setTimeout(() => setDetachingId(null), 320);
+	};
 
 	const showActionError = (error: unknown) => {
 		if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -782,16 +853,19 @@ const Dock = memo(function Dock() {
 	const handleContextMenu = (e: React.MouseEvent, app: AppInfo | null) => {
 		e.stopPropagation();
 		e.preventDefault();
+		if (app && app.path !== "start") triggerDetachEffect(itemKey(app));
 		setContextMenu({ x: e.clientX, y: e.clientY, app });
 	};
 
 	const handleExtraClick = (extra: DockExtra) => {
+		triggerDetachEffect(extra.id);
 		invoke("open_dock_extra", { kind: extra.kind, path: extra.path }).catch(showActionError);
 	};
 
 	const handleExtraContextMenu = (e: React.MouseEvent, extra: DockExtra) => {
 		e.stopPropagation();
 		e.preventDefault();
+		triggerDetachEffect(extra.id);
 		setContextMenu({ x: e.clientX, y: e.clientY, app: null, extra });
 	};
 
@@ -813,7 +887,6 @@ const Dock = memo(function Dock() {
 		closeMenu();
 	};
 
-	// Settings > Dock > Drives shows it again.
 	const hideDriveFromDock = (extra: DockExtra) => {
 		const letter = driveLetter(extra);
 		if (!letter) return;
@@ -826,10 +899,10 @@ const Dock = memo(function Dock() {
 	};
 
 	const openTaskView = () => {
+		triggerDetachEffect("task-view");
 		invoke("open_system_action", { action: "task-view" }).catch(showActionError);
 	};
 
-	// Like the taskbar's "Hide Task View button"; Settings turns it back on.
 	const hideTaskView = () => {
 		setDockTaskView(false);
 		localStorage.setItem("bloom-dock-task-view", "false");
@@ -839,9 +912,6 @@ const Dock = memo(function Dock() {
 		closeMenu();
 	};
 
-	// Measured before paint: the menu's height depends on which items it shows,
-	// so it opens just above the cursor and stays inside the dock window.
-	// Positions are in visual pixels; the menu's CSS zoom scales left/top.
 	const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
 	useLayoutEffect(() => {
 		if (!contextMenu || !menuRef.current) {
@@ -849,10 +919,13 @@ const Dock = memo(function Dock() {
 			return;
 		}
 		const margin = 8;
-		const r = menuRef.current.getBoundingClientRect();
+		const el = menuRef.current;
+		const r = el.getBoundingClientRect();
+		const fullW = Math.max(r.width, (el.offsetWidth || 180) * scale);
+		const fullH = Math.max(r.height, (el.offsetHeight || 160) * scale);
 		setMenuPos({
-			left: Math.max(margin, Math.min(contextMenu.x, window.innerWidth - r.width - margin)),
-			top: Math.max(margin, contextMenu.y - r.height - margin)
+			left: Math.max(margin, Math.min(contextMenu.x, window.innerWidth - fullW - margin)),
+			top: Math.max(margin, contextMenu.y - fullH - margin)
 		});
 	}, [contextMenu, scale]);
 
@@ -863,16 +936,13 @@ const Dock = memo(function Dock() {
 	};
 
 	const closePopup = () => {
-		setShowAddPopup(false);
-		setShowTrayPopup(false);
+		setActivePanel(null);
 		invoke("set_menu_open", { open: false, rect: null }).catch(() => {});
 	};
 
-	// Show live Windows notification icons in a compact, reversible overflow
-	// panel. The backend already discovers icon IDs and safely invokes each
-	// app's native menu; do not terminate processes behind the user's back.
+	// Refresh live Windows notification icons whenever the Tray Dynamic Island panel is open.
 	useEffect(() => {
-		if (!showTrayPopup) return;
+		if (activePanel !== "tray") return;
 		let active = true;
 		const load = async () => {
 			try {
@@ -880,155 +950,53 @@ const Dock = memo(function Dock() {
 				if (!active) return;
 				setTrayItems(items.filter((app) => app.tray_ids.length > 0));
 				setTrayLoading(false);
-				const uniquePaths = [...new Set(items.map((app) => app.path))];
-				const icons = await Promise.all(uniquePaths.map(async (path) => {
-					try {
-						return [path, await invoke<string | null>("get_app_icon", { path })] as const;
-					} catch {
-						return [path, null] as const;
+				const uniquePaths = [...new Set(items.filter((a) => !a.icon).map((app) => app.path))];
+				if (uniquePaths.length > 0) {
+					const icons = await Promise.all(
+						uniquePaths.map(async (path) => {
+							try {
+								return [path, await invoke<string | null>("get_app_icon", { path })] as const;
+							} catch {
+								return [path, null] as const;
+							}
+						})
+					);
+					if (active) {
+						setTrayIcons((prev) => ({
+							...prev,
+							...Object.fromEntries(
+								icons.filter((pair): pair is readonly [string, string] => !!pair[1])
+							)
+						}));
 					}
-				}));
-				if (active) setTrayIcons((prev) => ({
-					...prev,
-					...Object.fromEntries(icons.filter((pair): pair is readonly [string, string] => !!pair[1]))
-				}));
+				}
 			} catch (error) {
 				if (active) {
 					setTrayLoading(false);
 					console.error("Could not enumerate system tray apps:", error);
+					showActionError(error);
 				}
 			}
 		};
 		setTrayLoading(true);
 		load();
-		const interval = setInterval(load, 5000);
+		const interval = setInterval(load, 4000);
 		return () => {
 			active = false;
 			clearInterval(interval);
 		};
-	}, [showTrayPopup]);
+	}, [activePanel]);
 
-	const toggleTrayPopup = () => {
-		setShowAddPopup(false);
-		setContextMenu(null);
-		setActiveSubmenu(null);
-		setShowTrayPopup((open) => !open);
-	};
-
-	// A press outside the dock while a menu or the Add App popup is open. The
-	// click itself goes to whatever is under it (the window region keeps the
-	// dock out of the way), so the backend's mouse hook reports it instead.
 	useEffect(() => {
 		const unlisten = listen("dock-dismiss-menu", () => {
 			setContextMenu(null);
 			setActiveSubmenu(null);
-			setShowAddPopup(false);
-			setShowTrayPopup(false);
+			setActivePanel(null);
 		});
 		return () => {
 			unlisten.then((f) => f());
 		};
 	}, []);
-
-	// The tallest the expanded bar has been, which sets the region's bottom band.
-	const dockBandHeightRef = useRef(0);
-	const sendDockRegion = useMemo(
-		() =>
-			createRegionSender((rects) => {
-				invoke("set_window_region", { rects }).catch(() => {});
-			}),
-		[]
-	);
-
-	// Clip the dock window to what it draws (see window_region.rs). The bar
-	// gets a full-width band along the bottom, as tall as the expanded bar plus
-	// room for the icons' lift and tooltips above it, so its reveal and width
-	// animations are never clipped; the click-through switching still keeps
-	// the band clear unless the cursor is at the dock. The floating parts are
-	// measured, padded for their shadows. While an icon is dragged the whole
-	// window is included so the dragged icon isn't clipped.
-	useEffect(() => {
-		const bar = dockRef.current?.getBoundingClientRect();
-		if (bar && isExpanded && !isHidden && isVisible) {
-			dockBandHeightRef.current = Math.max(dockBandHeightRef.current, bar.height);
-		}
-		const band = (dockBandHeightRef.current || 72 * scale) + 64 * scale;
-		const wanted: RegionRect[] = [
-			{ x: 0, y: window.innerHeight - band, width: window.innerWidth, height: band }
-		];
-		if (isDragging) {
-			wanted.push({ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight });
-		}
-		wanted.push(
-			...measureElements([
-				[".preview-tooltip", 40],
-				[".context-menu", 34],
-				[".submenu", 34],
-				[".dock-toast", 20]
-			])
-		);
-		// The Add App popup grows from scaleY 0, and that animation doesn't
-		// re-render the dock, so its own box would be measured collapsed. Its
-		// anchor isn't transformed and is exactly as tall as the open popup, so
-		// the height comes from there and the width from the popup itself.
-		const popup = popupRef.current;
-		const anchor = popup?.parentElement;
-		if (popup && anchor) {
-			const p = popup.getBoundingClientRect();
-			const a = anchor.getBoundingClientRect();
-			wanted.push(padRect({ x: p.left, y: a.top, width: p.width, height: a.height }, 40));
-		}
-		const trayPanel = trayPopupRef.current;
-		const trayAnchor = trayPanel?.parentElement;
-		if (trayPanel && trayAnchor) {
-			const p = trayPanel.getBoundingClientRect();
-			const a = trayAnchor.getBoundingClientRect();
-			wanted.push(padRect({ x: p.left, y: a.top, width: p.width, height: a.height }, 40));
-		}
-		sendDockRegion(wanted);
-	});
-
-	useEffect(() => {
-		let open = false;
-		let rect = null;
-
-		if (contextMenu && menuRef.current) {
-			const r = menuRef.current.getBoundingClientRect();
-			rect = {
-				x: Math.round(r.x),
-				y: Math.round(r.y),
-				width: Math.round(r.width + (activeSubmenu ? 160 : 0)),
-				height: Math.round(r.height)
-			};
-			open = true;
-		} else if (showTrayPopup && trayPopupRef.current) {
-			const r = trayPopupRef.current.getBoundingClientRect();
-			const anchor = trayPopupRef.current.parentElement?.getBoundingClientRect();
-			rect = {
-				x: Math.round(r.x),
-				y: Math.round(anchor?.top ?? r.y),
-				width: Math.round(r.width),
-				height: Math.round(anchor?.height ?? r.height)
-			};
-			open = true;
-		} else if (showAddPopup && popupRef.current) {
-			const r = popupRef.current.getBoundingClientRect();
-			const anchor = popupRef.current.parentElement?.getBoundingClientRect();
-			// The popup animates from scaleY(0), so its transformed height is
-			// briefly tiny. Use the full untransformed anchor for hit testing:
-			// otherwise the first click in search is seen as "outside" and
-			// dismisses the popup through the native mouse hook.
-			rect = {
-				x: Math.round(r.x),
-				y: Math.round(anchor?.top ?? r.top),
-				width: Math.round(r.width),
-				height: Math.round(anchor?.height ?? r.height)
-			};
-			open = true;
-		}
-
-		invoke("set_menu_open", { open, rect }).catch(() => {});
-	}, [contextMenu, menuPos, showAddPopup, showTrayPopup, trayItems, pinnedApps, activeApps, activeSubmenu, scale]);
 
 	const dockItems = useMemo(() => {
 		const runningMap = new Map();
@@ -1040,7 +1008,6 @@ const Dock = memo(function Dock() {
 		const matchedRunningKeys = new Set<string>();
 
 		const findRunningApp = (p: AppInfo) => {
-			// 1. Try exact match by identity
 			const id = appIdentity(p.path, p.executable, p.name);
 			let running = runningMap.get(id);
 			if (running) {
@@ -1048,7 +1015,6 @@ const Dock = memo(function Dock() {
 				return running;
 			}
 
-			// 2. Try match by path (without executable)
 			const pathId = appIdentity(p.path);
 			running = runningMap.get(pathId);
 			if (running) {
@@ -1056,7 +1022,6 @@ const Dock = memo(function Dock() {
 				return running;
 			}
 
-			// 3. Try fallback match by executable name if defined
 			if (p.executable) {
 				const targetExe = p.executable.toLowerCase();
 				const found = activeApps.find(
@@ -1068,7 +1033,6 @@ const Dock = memo(function Dock() {
 				}
 			}
 
-			// 4. Try fallback match by path's file name (e.g., if path is "msedge" and running app's executable is "msedge.exe")
 			const pinFilename = p.path.split("/").pop()?.split("\\").pop()?.toLowerCase() || "";
 			if (pinFilename) {
 				const found = activeApps.find((a) => {
@@ -1089,9 +1053,6 @@ const Dock = memo(function Dock() {
 				}
 			}
 
-			// A pinned shell id and a visible window can have different paths
-			// (for example com.sehaz.bloom and bloom.exe). Match both visible
-			// and background apps so the window cannot become a second dock item.
 			const equivalent = activeApps.find(
 				(app) => !matchedRunningKeys.has(itemKey(app)) && isSameApp(p, app)
 			);
@@ -1104,7 +1065,7 @@ const Dock = memo(function Dock() {
 
 		const pinned: AppInfo[] = [
 			{
-				name: "Start",
+				name: "Démarrer",
 				path: "start",
 				icon: null,
 				is_running: false,
@@ -1146,15 +1107,195 @@ const Dock = memo(function Dock() {
 	);
 	const unpinnedItems = useMemo(() => dockItems.filter((i) => !i.is_pinned), [dockItems]);
 
-	// Latest state for the Win+Number listener, which subscribes only once.
+	// Dynamic Island target dimensions when a panel is open inside the Dock container.
+	const naturalBarWidth = useMemo(() => {
+		const count = pinnedItems.length + unpinnedItems.length + dockExtras.length + (dockTaskView ? 1 : 0);
+		return Math.max(360, 210 + count * 44);
+	}, [pinnedItems.length, unpinnedItems.length, dockExtras.length, dockTaskView]);
+
+	const maxAvailableHeight = Math.max(340, Math.floor((viewportHeight - 16) / (scale || 1)));
+
+	const islandTarget = useMemo(() => {
+		if (!activePanel) return null;
+		if (activePanel === "start") {
+			return {
+				width: Math.max(600, naturalBarWidth),
+				height: Math.min(540, maxAvailableHeight)
+			};
+		}
+		if (activePanel === "search") {
+			return {
+				width: Math.max(560, naturalBarWidth),
+				height: Math.min(490, maxAvailableHeight)
+			};
+		}
+		if (activePanel === "tray") {
+			return {
+				width: Math.max(430, naturalBarWidth),
+				height: Math.min(340, maxAvailableHeight)
+			};
+		}
+		return {
+			width: Math.max(480, naturalBarWidth),
+			height: Math.min(470, maxAvailableHeight)
+		};
+	}, [activePanel, naturalBarWidth, maxAvailableHeight]);
+
+	const dockBandHeightRef = useRef(0);
+	const sendDockRegion = useMemo(
+		() =>
+			createRegionSender((rects) => {
+				invoke("set_window_region", { rects }).catch(() => {});
+			}),
+		[]
+	);
+
+	// Synchronize SetWindowRgn with the Dock bar (including 100% full-width taskbar
+	// and upward Dynamic Island expansion).
+	const computeAndSendDockRegion = () => {
+		const bar = dockRef.current?.getBoundingClientRect();
+		if (bar && isExpanded && !isHidden && isVisible) {
+			dockBandHeightRef.current = Math.max(dockBandHeightRef.current, Math.min(bar.height, 90));
+		}
+		const liftRoom = 56 * scale;
+		const wanted: RegionRect[] = [];
+
+		if (bar && isExpanded && !isHidden && isVisible && !startupAnimating) {
+			wanted.push(
+				...computeDockBarRect({
+					windowWidth: window.innerWidth,
+					windowHeight: window.innerHeight,
+					dockRect: {
+						x: bar.left,
+						y: bar.top - liftRoom,
+						width: bar.width,
+						height: bar.height + liftRoom
+					},
+					isVisible,
+					isExpanded,
+					isHidden,
+					isDockedExpanded: isDockedExpanded || isAdaptive,
+					adaptiveWidth: isDockedExpanded || isAdaptive,
+					dockPad: isDockedExpanded ? 20 : 16
+				})
+			);
+		} else {
+			const band = (dockBandHeightRef.current || 72 * scale) + 64 * scale;
+			wanted.push({ x: 0, y: window.innerHeight - band, width: window.innerWidth, height: band });
+		}
+
+		// When a Dynamic Island panel is open or opening, immediately include its full target box
+		// in SetWindowRgn so every button/input inside the stretched Dock is clickable right away.
+		if (islandTarget) {
+			const targetW = islandTarget.width * scale + 32;
+			const targetH = islandTarget.height * scale + 32;
+			wanted.push({
+				x: Math.max(0, Math.round((window.innerWidth - targetW) / 2)),
+				y: Math.max(0, Math.round(window.innerHeight - targetH)),
+				width: Math.min(window.innerWidth, Math.round(targetW)),
+				height: Math.min(window.innerHeight, Math.round(targetH))
+			});
+		}
+
+		if (isDragging) {
+			wanted.push({ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight });
+		}
+		wanted.push(
+			...measureElements([
+				[".preview-tooltip", 40],
+				[".context-menu", 34],
+				[".submenu", 34],
+				[".dock-toast", 20]
+			]),
+			...measureDockPopups(undefined, scale)
+		);
+
+		sendDockRegion(wanted);
+	};
+
+	useEffect(() => {
+		computeAndSendDockRegion();
+	});
+
+	useEffect(() => {
+		let rafId = 0;
+		const start = performance.now();
+		const step = (now: number) => {
+			computeAndSendDockRegion();
+			if (now - start < 520) {
+				rafId = requestAnimationFrame(step);
+			}
+		};
+		rafId = requestAnimationFrame(step);
+		return () => cancelAnimationFrame(rafId);
+	}, [
+		isDockedExpanded,
+		isAdaptive,
+		isExpanded,
+		isHidden,
+		activePanel,
+		contextMenu,
+		scale,
+		viewportWidth,
+		viewportHeight
+	]);
+
+	useEffect(() => {
+		let open = false;
+		let rect = null;
+
+		if (contextMenu && menuRef.current) {
+			const el = menuRef.current;
+			const r = el.getBoundingClientRect();
+			const fullW = Math.max(r.width, (el.offsetWidth || 180) * scale);
+			const fullH = Math.max(r.height, (el.offsetHeight || 160) * scale);
+			const box = untransformedPopupBox(
+				{ x: r.left, y: r.top, width: r.width, height: r.height },
+				fullW + (activeSubmenu ? 160 : 0),
+				fullH,
+				10
+			);
+			rect = {
+				x: Math.round(box.x),
+				y: Math.round(box.y),
+				width: Math.round(box.width),
+				height: Math.round(box.height)
+			};
+			open = true;
+		} else if (islandTarget && dockRef.current) {
+			const r = dockRef.current.getBoundingClientRect();
+			const targetW = Math.max(r.width, islandTarget.width * scale);
+			const targetH = Math.max(r.height, islandTarget.height * scale);
+			const x = Math.round(Math.min(r.left, (window.innerWidth - targetW) / 2) - 12);
+			const y = Math.round(Math.min(r.top, window.innerHeight - targetH) - 12);
+			rect = {
+				x: Math.max(0, x),
+				y: Math.max(0, y),
+				width: Math.round(targetW + 24),
+				height: Math.round(targetH + 24)
+			};
+			open = true;
+		}
+
+		invoke("set_menu_open", { open, rect }).catch(() => {});
+	}, [
+		contextMenu,
+		menuPos,
+		activePanel,
+		islandTarget,
+		trayItems,
+		pinnedApps,
+		activeApps,
+		activeSubmenu,
+		scale
+	]);
+
 	useEffect(() => {
 		pinnedItemsRef.current = pinnedItems;
 		handleAppClickRef.current = handleAppClick;
 	});
 
 	useEffect(() => {
-		// The backend claims Win+1-9 while the native taskbar is hidden and reports
-		// which pinned slot was pressed; behaviour matches a click on that icon.
 		const unlisten = listen<number>("dock-win-number", (event) => {
 			const app = pinnedItemsRef.current[event.payload];
 			if (app) handleAppClickRef.current(app);
@@ -1164,8 +1305,6 @@ const Dock = memo(function Dock() {
 		};
 	}, []);
 
-	// Items are keyed by identity, not path: web apps running in the same
-	// browser share one executable path.
 	const handleReorder = (newKeys: string[]) => {
 		const oldKeys = pinnedApps.map(itemKey);
 		if (JSON.stringify(newKeys) !== JSON.stringify(oldKeys)) {
@@ -1183,8 +1322,6 @@ const Dock = memo(function Dock() {
 	};
 
 	useEffect(() => {
-		// Only report true dock-window hover, not the edge-hover from Rust,
-		// to avoid a feedback loop that keeps the dock open.
 		invoke("set_dock_hovered", { hovered: isDockHovered }).catch(() => {});
 	}, [isDockHovered]);
 
@@ -1202,7 +1339,7 @@ const Dock = memo(function Dock() {
 		isPreviewHoveredRef.current = false;
 		hoveredAppRef.current = hoveredApp;
 
-		if (!hoveredApp) {
+		if (!hoveredApp || activePanel !== null) {
 			const timer = setTimeout(() => setPreviewData(null), 100);
 			return () => clearTimeout(timer);
 		}
@@ -1258,13 +1395,32 @@ const Dock = memo(function Dock() {
 		return () => {
 			if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
 		};
-	}, [hoveredApp, isDragging, dockItems]);
+	}, [hoveredApp, isDragging, dockItems, activePanel]);
 
 	const iconVariants = {
-		idle: { y: 0, scale: 1 },
-		hover: { y: -5, scale: 1.1 },
-		drag: { y: -10, scale: 1.1, opacity: 0.8 },
-		tap: { scale: 0.95 }
+		idle: { y: 0, scaleX: 1, scaleY: 1, scale: 1 },
+		hover: {
+			y: -5,
+			scaleX: 1.06,
+			scaleY: 1.1,
+			scale: 1,
+			transition: { type: "spring" as const, stiffness: 420, damping: 20 }
+		},
+		drag: { y: -10, scaleX: 1.08, scaleY: 1.08, scale: 1.1, opacity: 0.8 },
+		tap: {
+			y: 2,
+			scaleX: 1.18,
+			scaleY: 0.82,
+			scale: 0.96,
+			transition: { type: "spring" as const, stiffness: 520, damping: 18 }
+		},
+		detach: {
+			y: -7,
+			scaleX: 0.88,
+			scaleY: 1.22,
+			scale: 1,
+			transition: { type: "spring" as const, stiffness: 380, damping: 16, mass: 0.7 }
+		}
 	};
 
 	const renderExtra = (extra: DockExtra) => (
@@ -1293,7 +1449,15 @@ const Dock = memo(function Dock() {
 			<motion.div
 				className="dock-icon"
 				variants={iconVariants}
-				animate={pressedApp === extra.id ? "tap" : hoveredApp === extra.id ? "hover" : "idle"}
+				animate={
+					detachingId === extra.id
+						? "detach"
+						: pressedApp === extra.id
+							? "tap"
+							: hoveredApp === extra.id
+								? "hover"
+								: "idle"
+				}
 				onPointerDown={() => setPressedApp(extra.id)}
 				onPointerUp={() => setPressedApp(null)}
 				onPointerCancel={() => setPressedApp(null)}
@@ -1307,8 +1471,40 @@ const Dock = memo(function Dock() {
 		</motion.div>
 	);
 
+	const isFullWidthTaskbar = (isDockedExpanded || isAdaptive) && activePanel === null;
+	const targetDockWidth =
+		!isExpanded || isHidden || !isVisible
+			? 34
+			: islandTarget
+				? islandTarget.width
+				: isFullWidthTaskbar
+					? fullScreenWidth
+					: "auto";
+	const targetDockHeight =
+		!isExpanded || isHidden || !isVisible
+			? 34
+			: islandTarget
+				? islandTarget.height
+				: 52;
+	const targetTopRadius =
+		!isImpacted && !isExpanded
+			? 17
+			: isHidden || !isVisible
+				? 17
+				: islandTarget
+					? 22
+					: isFullWidthTaskbar
+						? 0
+						: 18;
+
 	return (
-		<div className={`dock-container ${isDragging ? "dragging" : ""}`} onClick={closeMenu}>
+		<div
+			className={`dock-container ${isDragging ? "dragging" : ""} ${isFullWidthTaskbar ? "dock-container-fullwidth" : ""}`}
+			onClick={() => {
+				closeMenu();
+				if (activePanel !== null) closePopup();
+			}}
+		>
 			<div
 				style={{
 					width: "100%",
@@ -1321,18 +1517,21 @@ const Dock = memo(function Dock() {
 				<motion.div
 					ref={dockRef}
 					layout
-					className={`dock ${isExpanded && !isHidden ? "dock-expanded" : ""} ${isImpacted && !isExpanded && !isHidden ? "dock-impacted" : ""} ${dockIconOnly ? "dock-icon-only" : ""} ${isAdaptive ? "dock-adaptive" : ""}`}
+					className={`dock ${isExpanded && !isHidden ? "dock-expanded" : ""} ${isImpacted && !isExpanded && !isHidden ? "dock-impacted" : ""} ${dockIconOnly ? "dock-icon-only" : ""} ${isFullWidthTaskbar ? "dock-maximized-expanded dock-fullwidth" : ""} ${activePanel ? `dock-island-open dock-island-${activePanel}` : ""}`}
 					onMouseEnter={() => setIsDockHovered(true)}
 					onMouseLeave={() => {
 						setIsDockHovered(false);
 						setHoveredApp(null);
 						setPressedApp(null);
 					}}
+					onClick={(e) => e.stopPropagation()}
 					initial={{
 						y: -800,
 						opacity: 1,
 						width: 34,
 						height: 34,
+						paddingLeft: 0,
+						paddingRight: 0,
 						borderTopLeftRadius: 17,
 						borderTopRightRadius: 17,
 						borderBottomLeftRadius: 17,
@@ -1340,11 +1539,12 @@ const Dock = memo(function Dock() {
 					}}
 					animate={{
 						y: !isReady ? -800 : isVisible ? (isHidden ? 100 : 0) : 150,
-						width:
-							isExpanded && !isHidden && isVisible ? (isAdaptive ? adaptiveWidth : "auto") : 34,
-						height: isExpanded && !isHidden && isVisible ? "auto" : 34,
-						borderTopLeftRadius: (isImpacted || isExpanded) && !isHidden && isVisible ? 18 : 17,
-						borderTopRightRadius: (isImpacted || isExpanded) && !isHidden && isVisible ? 18 : 17,
+						width: targetDockWidth,
+						height: targetDockHeight,
+						paddingLeft: isExpanded && !isHidden && isVisible ? 14 : 0,
+						paddingRight: isExpanded && !isHidden && isVisible ? 14 : 0,
+						borderTopLeftRadius: targetTopRadius,
+						borderTopRightRadius: targetTopRadius,
 						borderBottomLeftRadius: (isImpacted || isExpanded) && !isHidden && isVisible ? 0 : 17,
 						borderBottomRightRadius: (isImpacted || isExpanded) && !isHidden && isVisible ? 0 : 17,
 						opacity: isVisible ? 1 : 0,
@@ -1352,9 +1552,11 @@ const Dock = memo(function Dock() {
 					}}
 					transition={{
 						y: { type: "spring", stiffness: 400, damping: 35, mass: 0.8 },
-						width: { type: "spring", stiffness: 250, damping: 22, mass: 0.8 },
-						height: { type: "spring", stiffness: 250, damping: 22, mass: 0.8 },
-						layout: isDragging ? { duration: 0 } : { type: "spring", stiffness: 300, damping: 25 },
+						width: { type: "spring", stiffness: 320, damping: 28, mass: 0.8 },
+						height: { type: "spring", stiffness: 340, damping: 28, mass: 0.8 },
+						paddingLeft: { type: "spring", stiffness: 320, damping: 24, mass: 0.85 },
+						paddingRight: { type: "spring", stiffness: 320, damping: 24, mass: 0.85 },
+						layout: isDragging ? { duration: 0 } : { type: "spring", stiffness: 320, damping: 28 },
 						borderTopLeftRadius: { type: "spring", stiffness: 500, damping: 30 },
 						borderTopRightRadius: { type: "spring", stiffness: 500, damping: 30 },
 						borderBottomLeftRadius: { type: "spring", stiffness: 500, damping: 30 },
@@ -1365,26 +1567,111 @@ const Dock = memo(function Dock() {
 					style={{ originX: 0.5, originY: 1, minWidth: 34 }}
 					onContextMenu={(e) => handleContextMenu(e, null)}
 				>
-					<EdgeSurface edge="bottom" flares={isExpanded && !isHidden} />
+					<EdgeSurface
+						edge="bottom"
+						flares={isExpanded && !isHidden && !isFullWidthTaskbar}
+					/>
+
+					{/* Upper Dynamic Island stretched area inside the Dock itself */}
+					<AnimatePresence mode="wait">
+						{isExpanded && activePanel === "start" && (
+							<DockStartMenuPanel
+								key="island-start"
+								panelRef={islandPanelRef}
+								pinnedApps={pinnedItems}
+								installedApps={installedApps}
+								customIcons={customIcons}
+								cachedIcons={iconsRef.current}
+								currentUser={currentUser}
+								onLaunchApp={(app) => {
+									closePopup();
+									handleAppClick(app);
+								}}
+								onSystemAction={(action) => {
+									closePopup();
+									invoke("open_system_action", { action }).catch(showActionError);
+								}}
+								onClose={closePopup}
+							/>
+						)}
+						{isExpanded && activePanel === "search" && (
+							<DockSearchPanel
+								key="island-search"
+								panelRef={islandPanelRef}
+								runningApps={activeApps}
+								installedApps={installedApps}
+								onLaunchApp={(app) => {
+									closePopup();
+									handleAppClick(app);
+								}}
+								onNativeWindowsSearch={() => {
+									closePopup();
+									invoke("open_system_action", { action: "search" }).catch(showActionError);
+								}}
+								onClose={closePopup}
+							/>
+						)}
+						{isExpanded && activePanel === "tray" && (
+							<DockTrayPanel
+								key="island-tray"
+								panelRef={islandPanelRef}
+								trayItems={trayItems}
+								trayIcons={trayIcons}
+								trayLoading={trayLoading}
+								onRefresh={() => {
+									setTrayLoading(true);
+									invoke<TrayApp[]>("get_tray_apps")
+										.then((items) => setTrayItems(items.filter((app) => app.tray_ids.length > 0)))
+										.catch(showActionError)
+										.finally(() => setTrayLoading(false));
+								}}
+								onActivate={(trayId) => {
+									closePopup();
+									invoke("activate_tray_icon", { trayId }).catch(showActionError);
+								}}
+								onContextMenu={(trayId) => {
+									closePopup();
+									void openTrayMenu(trayId);
+								}}
+								onOpenTaskManager={() => {
+									closePopup();
+									invoke("open_system_action", { action: "task-manager" }).catch(showActionError);
+								}}
+								onClose={closePopup}
+							/>
+						)}
+						{isExpanded && activePanel === "add" && (
+							<DockAddAppPanel
+								key="island-add"
+								panelRef={islandPanelRef}
+								runningApps={activeApps}
+								installedApps={installedApps}
+								pinned={pinnedApps}
+								onAdd={(app) => {
+									togglePin(app);
+									closePopup();
+								}}
+								onClose={closePopup}
+							/>
+						)}
+					</AnimatePresence>
+
+					{/* Bottom Dock icon bar — stays anchored at the bottom of the stretched block */}
 					<AnimatePresence>
 						{isExpanded && (
 							<motion.div
+								ref={barRowRef}
 								key="dock-content"
 								initial={{ opacity: 0 }}
 								animate={{ opacity: 1 }}
 								exit={{ opacity: 0 }}
 								transition={{ duration: 0.15 }}
-								className="dock-reorder-container"
+								className={`dock-reorder-container ${activePanel ? "dock-bar-with-island" : ""}`}
 							>
+								{/* 1. Start / Windows button — 100% static (no bounce, zoom, or y movement) */}
 								{startItem && (
-									<motion.div
-										initial={{ opacity: 0, scale: 0 }}
-										animate={{ opacity: 1, scale: 1 }}
-										transition={{
-											opacity: { duration: 0.15, delay: 0.15 },
-											scale: { type: "spring", stiffness: 400, damping: 25, delay: 0.15 }
-										}}
-										className="dock-icon-wrapper"
+									<div
+										className="dock-icon-wrapper dock-system-wrapper"
 										onContextMenu={(e) => handleContextMenu(e, startItem)}
 										onMouseEnter={() => setHoveredApp(itemKey(startItem))}
 										onMouseLeave={() => {
@@ -1393,25 +1680,19 @@ const Dock = memo(function Dock() {
 										}}
 									>
 										{(!dockPreviewEnabled ||
-											(dockPreviewEnabled && hoveredApp === itemKey(startItem))) && (
-											<div className="tooltip">{startItem.name}</div>
-										)}
-										<motion.div
-											className="dock-icon"
-											variants={iconVariants}
-											animate={
-												pressedApp === itemKey(startItem)
-													? "tap"
-													: hoveredApp === itemKey(startItem)
-														? "hover"
-														: "idle"
-											}
-											onPointerDown={() => setPressedApp(itemKey(startItem))}
-											onPointerUp={() => setPressedApp(null)}
-											onPointerCancel={() => setPressedApp(null)}
+											(dockPreviewEnabled && hoveredApp === itemKey(startItem))) &&
+											activePanel === null && (
+												<div className="tooltip">{startItem.name}</div>
+											)}
+										<div
+											className={`dock-icon dock-start-btn${activePanel === "start" ? " is-open" : ""}`}
+											role="button"
+											tabIndex={0}
+											aria-label="Menu Démarrer"
+											aria-expanded={activePanel === "start"}
 											onClick={(e) => {
 												e.stopPropagation();
-												handleAppClick(startItem);
+												toggleDockPanel("start");
 											}}
 										>
 											<img
@@ -1423,40 +1704,40 @@ const Dock = memo(function Dock() {
 												}
 												draggable={false}
 											/>
-										</motion.div>
-									</motion.div>
+										</div>
+									</div>
 								)}
 
-								{/* Native Windows Search, styled like a compact Windows 11 pill. */}
-								<motion.button
+								{/* 2. Search pill — 100% static (no bounce, zoom, or y movement) */}
+								<button
 									type="button"
-									className="dock-search-pill"
-									title="Rechercher sur Windows"
-									aria-label="Rechercher sur Windows"
+									className={`dock-search-pill${activePanel === "search" ? " is-open" : ""}`}
+									title="Rechercher dans Bloom et sur Windows"
+									aria-label="Rechercher dans Bloom et sur Windows"
+									aria-expanded={activePanel === "search"}
 									onClick={(e) => {
 										e.stopPropagation();
-										closePopup();
-										invoke("open_system_action", { action: "search" }).catch(showActionError);
+										toggleDockPanel("search");
 									}}
 								>
 									<Search size={15} aria-hidden="true" />
 									<span>Recherche</span>
-								</motion.button>
+								</button>
 
-								{/* Windows notification overflow, with native app menus. */}
-								<motion.button
+								{/* 3. Background apps chevron ^ — 100% static (no bounce, zoom, or y movement) */}
+								<button
 									type="button"
-									className={`dock-tray-toggle${showTrayPopup ? " is-open" : ""}`}
+									className={`dock-tray-toggle${activePanel === "tray" ? " is-open" : ""}`}
 									title="Applications en arrière-plan"
 									aria-label="Afficher les applications en arrière-plan"
-									aria-expanded={showTrayPopup}
+									aria-expanded={activePanel === "tray"}
 									onClick={(e) => {
 										e.stopPropagation();
-										toggleTrayPopup();
+										toggleDockPanel("tray");
 									}}
 								>
 									<ChevronUp size={18} aria-hidden="true" />
-								</motion.button>
+								</button>
 
 								{dockTaskView && (
 									<motion.div
@@ -1483,11 +1764,13 @@ const Dock = memo(function Dock() {
 											className="dock-icon"
 											variants={iconVariants}
 											animate={
-												pressedApp === "task-view"
-													? "tap"
-													: hoveredApp === "task-view"
-														? "hover"
-														: "idle"
+												detachingId === "task-view"
+													? "detach"
+													: pressedApp === "task-view"
+														? "tap"
+														: hoveredApp === "task-view"
+															? "hover"
+															: "idle"
 											}
 											onPointerDown={() => setPressedApp("task-view")}
 											onPointerUp={() => setPressedApp(null)}
@@ -1539,7 +1822,11 @@ const Dock = memo(function Dock() {
 											onAuxClick={(e) => handleMiddleClick(e, app)}
 											onClick={(e) => {
 												e.stopPropagation();
-												if (!isDragging) handleAppClick(app);
+												if (!isDragging) {
+													triggerDetachEffect(itemKey(app));
+													if (activePanel !== null) closePopup();
+													handleAppClick(app);
+												}
 											}}
 										>
 											<motion.div
@@ -1558,15 +1845,17 @@ const Dock = memo(function Dock() {
 											>
 												<AnimatePresence>
 													{dockPreviewEnabled &&
+														activePanel === null &&
 														previewData &&
 														previewData.id === itemKey(app) &&
 														hoveredApp === itemKey(app) && (
 															<motion.div
-																className={`preview-tooltip ${previewData.previews.length > 1 ? "multi" : ""}`}
-																initial={{ opacity: 0, y: 10, scale: 0.95 }}
-																animate={{ opacity: 1, y: 0, scale: 1 }}
-																exit={{ opacity: 0, scale: 0.95 }}
-																transition={{ duration: 0.15 }}
+																className={`preview-tooltip dock-tooltip-popup ${previewData.previews.length > 1 ? "multi" : ""}`}
+																style={{ transformOrigin: "bottom center" }}
+																initial={DETACH_INITIAL}
+																animate={DETACH_ANIMATE}
+																exit={DETACH_EXIT}
+																transition={DETACH_SPRING}
 																onMouseEnter={() => {
 																	isPreviewHoveredRef.current = true;
 																}}
@@ -1610,22 +1899,24 @@ const Dock = memo(function Dock() {
 														)}
 												</AnimatePresence>
 
-												{/* Fallback to text tooltip if previews are disabled, app isn't running, or preview failed to load */}
-												{(!dockPreviewEnabled ||
-													(dockPreviewEnabled && hoveredApp === itemKey(app) && !previewData)) && (
-													<div className="tooltip">{app.name}</div>
-												)}
+												{activePanel === null &&
+													(!dockPreviewEnabled ||
+														(dockPreviewEnabled && hoveredApp === itemKey(app) && !previewData)) && (
+														<div className="tooltip">{app.name}</div>
+													)}
 												<motion.div
 													className="dock-icon"
 													variants={iconVariants}
 													animate={
-														pressedApp === itemKey(app)
-															? "tap"
-															: isDragging && !app.is_pinned
-																? "idle"
-																: hoveredApp === itemKey(app) && !isDragging
-																	? "hover"
-																	: "idle"
+														detachingId === itemKey(app)
+															? "detach"
+															: pressedApp === itemKey(app)
+																? "tap"
+																: isDragging && !app.is_pinned
+																	? "idle"
+																	: hoveredApp === itemKey(app) && !isDragging
+																		? "hover"
+																		: "idle"
 													}
 													whileDrag="drag"
 													onPointerDown={() => setPressedApp(itemKey(app))}
@@ -1639,9 +1930,6 @@ const Dock = memo(function Dock() {
 															: app.hwnd
 																? `${app.path}-${app.hwnd}`
 																: app.path;
-														// Running host items must not use the shared path fallback: the
-														// browser and its PWAs share one path, so it would leak one item's
-														// icon onto the others.
 														const allowPathFallback = !isHost || !app.is_running;
 														const brandIcon = cleanBrandIcon(app);
 														const icon =
@@ -1661,7 +1949,13 @@ const Dock = memo(function Dock() {
 															<img
 																src={icon}
 																alt={app.name}
-																className={brandIcon ? "dock-brand-icon" : isBloomOrSettings ? "bloom-icon-img" : ""}
+																className={
+																	brandIcon
+																		? "dock-brand-icon"
+																		: isBloomOrSettings
+																			? "bloom-icon-img"
+																			: ""
+																}
 																draggable={false}
 															/>
 														) : (
@@ -1719,20 +2013,24 @@ const Dock = memo(function Dock() {
 										onAuxClick={(e) => handleMiddleClick(e, app)}
 										onClick={(e) => {
 											e.stopPropagation();
+											triggerDetachEffect(itemKey(app));
+											if (activePanel !== null) closePopup();
 											handleAppClick(app);
 										}}
 									>
 										<AnimatePresence>
 											{dockPreviewEnabled &&
+												activePanel === null &&
 												previewData &&
 												previewData.id === itemKey(app) &&
 												hoveredApp === itemKey(app) && (
 													<motion.div
-														className={`preview-tooltip ${previewData.previews.length > 1 ? "multi" : ""}`}
-														initial={{ opacity: 0, y: 10, scale: 0.95 }}
-														animate={{ opacity: 1, y: 0, scale: 1 }}
-														exit={{ opacity: 0, scale: 0.95 }}
-														transition={{ duration: 0.15 }}
+														className={`preview-tooltip dock-tooltip-popup ${previewData.previews.length > 1 ? "multi" : ""}`}
+														style={{ transformOrigin: "bottom center" }}
+														initial={DETACH_INITIAL}
+														animate={DETACH_ANIMATE}
+														exit={DETACH_EXIT}
+														transition={DETACH_SPRING}
 														onMouseEnter={() => {
 															isPreviewHoveredRef.current = true;
 														}}
@@ -1775,19 +2073,22 @@ const Dock = memo(function Dock() {
 													</motion.div>
 												)}
 										</AnimatePresence>
-										{(!dockPreviewEnabled ||
-											(dockPreviewEnabled && hoveredApp === itemKey(app) && !previewData)) && (
-											<div className="tooltip">{app.name}</div>
-										)}
+										{activePanel === null &&
+											(!dockPreviewEnabled ||
+												(dockPreviewEnabled && hoveredApp === itemKey(app) && !previewData)) && (
+												<div className="tooltip">{app.name}</div>
+											)}
 										<motion.div
 											className="dock-icon"
 											variants={iconVariants}
 											animate={
-												pressedApp === itemKey(app)
-													? "tap"
-													: hoveredApp === itemKey(app) && !isDragging
-														? "hover"
-														: "idle"
+												detachingId === itemKey(app)
+													? "detach"
+													: pressedApp === itemKey(app)
+														? "tap"
+														: hoveredApp === itemKey(app) && !isDragging
+															? "hover"
+															: "idle"
 											}
 											onPointerDown={() => setPressedApp(itemKey(app))}
 											onPointerUp={() => setPressedApp(null)}
@@ -1800,9 +2101,6 @@ const Dock = memo(function Dock() {
 													: app.hwnd
 														? `${app.path}-${app.hwnd}`
 														: app.path;
-												// Running host items must not use the shared path fallback: the
-												// browser and its PWAs share one path, so it would leak one item's
-												// icon onto the others.
 												const allowPathFallback = !isHost || !app.is_running;
 												const brandIcon = cleanBrandIcon(app);
 												const icon =
@@ -1820,7 +2118,13 @@ const Dock = memo(function Dock() {
 													<img
 														src={icon}
 														alt={app.name}
-														className={brandIcon ? "dock-brand-icon" : isBloomOrSettings ? "bloom-icon-img" : ""}
+														className={
+															brandIcon
+																? "dock-brand-icon"
+																: isBloomOrSettings
+																	? "bloom-icon-img"
+																	: ""
+														}
 														draggable={false}
 													/>
 												) : (
@@ -1853,304 +2157,308 @@ const Dock = memo(function Dock() {
 				</motion.div>
 			</div>
 
-			{contextMenu && (
-				<div
-					ref={menuRef}
-					className="context-menu"
-					style={{
-						left: (menuPos?.left ?? contextMenu.x) / scale,
-						top: (menuPos?.top ?? contextMenu.y) / scale,
-						visibility: menuPos ? "visible" : "hidden",
-						zoom: scale
-					}}
-					onClick={(e) => e.stopPropagation()}
-				>
-					{!contextMenu.extra &&
-						!contextMenu.taskView &&
-						(!contextMenu.app || contextMenu.app.path === "start") && (
-						<div
-							style={{
-								maxHeight: Math.max(64, window.innerHeight / scale - 200),
-								overflowY: "auto"
-							}}
-						>
-							{(contextMenu.app
-								? [
-										["installed-apps", "Installed Apps"],
-										["power-options", "Power Options"],
-										["device-manager", "Device Manager"],
-										["network-connections", "Network Connections"],
-										["disk-management", "Disk Management"],
-										["computer-management", "Computer Management"],
-										["task-manager", "Task Manager"],
-										["settings", "Settings"]
-									]
-								: [
-										["task-manager", "Task Manager"],
-										["taskbar-settings", "Taskbar Settings"]
-									]
-							).map(([action, label]) => (
+			<AnimatePresence>
+				{contextMenu && (
+					<motion.div
+						key="dock-context-menu"
+						ref={menuRef}
+						className="context-menu dock-context-menu"
+						style={{
+							left: (menuPos?.left ?? contextMenu.x) / scale,
+							top: (menuPos?.top ?? contextMenu.y) / scale,
+							visibility: menuPos ? "visible" : "hidden",
+							zoom: scale,
+							transformOrigin: "bottom center"
+						}}
+						initial={DETACH_INITIAL}
+						animate={DETACH_ANIMATE}
+						exit={DETACH_EXIT}
+						transition={DETACH_SPRING}
+						onClick={(e) => e.stopPropagation()}
+					>
+						{!contextMenu.extra &&
+							!contextMenu.taskView &&
+							(!contextMenu.app || contextMenu.app.path === "start") && (
 								<div
-									key={action}
+									style={{
+										maxHeight: Math.max(64, window.innerHeight / scale - 200),
+										overflowY: "auto"
+									}}
+								>
+									{(contextMenu.app
+										? [
+												["installed-apps", "Installed Apps"],
+												["power-options", "Power Options"],
+												["device-manager", "Device Manager"],
+												["network-connections", "Network Connections"],
+												["disk-management", "Disk Management"],
+												["computer-management", "Computer Management"],
+												["task-manager", "Task Manager"],
+												["settings", "Settings"]
+											]
+										: [
+												["task-manager", "Task Manager"],
+												["taskbar-settings", "Taskbar Settings"]
+											]
+									).map(([action, label]) => (
+										<div
+											key={action}
+											className="menu-item"
+											onClick={() => {
+												closeMenu();
+												invoke("open_system_action", { action }).catch(showActionError);
+											}}
+										>
+											{label}
+										</div>
+									))}
+									<div className="menu-divider" />
+								</div>
+							)}
+						{contextMenu.extra ? (
+							<>
+								<div
+									className="menu-item"
+									onClick={() => {
+										const extra = contextMenu.extra!;
+										closeMenu();
+										handleExtraClick(extra);
+									}}
+								>
+									Open
+								</div>
+								{contextMenu.extra.kind === "drive" && contextMenu.extra.removable && (
+									<div className="menu-item" onClick={() => ejectExtra(contextMenu.extra!)}>
+										Eject
+									</div>
+								)}
+								{contextMenu.extra.kind === "drive" && (
+									<>
+										<div className="menu-divider" />
+										<div
+											className="menu-item quit"
+											onClick={() => hideDriveFromDock(contextMenu.extra!)}
+										>
+											Remove from Dock
+										</div>
+									</>
+								)}
+								{contextMenu.extra.kind === "custom" && (
+									<>
+										<div className="menu-divider" />
+										<div
+											className="menu-item quit"
+											onClick={() => removeExtraFromDock(contextMenu.extra!)}
+										>
+											Remove from Dock
+										</div>
+									</>
+								)}
+							</>
+						) : contextMenu.taskView ? (
+							<>
+								<div
 									className="menu-item"
 									onClick={() => {
 										closeMenu();
-										invoke("open_system_action", { action }).catch(showActionError);
+										openTaskView();
 									}}
 								>
-									{label}
+									Open Task View
 								</div>
-							))}
-							<div className="menu-divider" />
-						</div>
-					)}
-					{contextMenu.extra ? (
-						<>
-							<div
-								className="menu-item"
-								onClick={() => {
-									const extra = contextMenu.extra!;
-									closeMenu();
-									handleExtraClick(extra);
-								}}
-							>
-								Open
-							</div>
-							{contextMenu.extra.kind === "drive" && contextMenu.extra.removable && (
-								<div className="menu-item" onClick={() => ejectExtra(contextMenu.extra!)}>
-									Eject
+								<div className="menu-divider" />
+								<div className="menu-item" onClick={hideTaskView}>
+									Hide Task View
 								</div>
-							)}
-							{contextMenu.extra.kind === "drive" && (
-								<>
-									<div className="menu-divider" />
-									<div
-										className="menu-item quit"
-										onClick={() => hideDriveFromDock(contextMenu.extra!)}
-									>
-										Remove from Dock
-									</div>
-								</>
-							)}
-							{contextMenu.extra.kind === "custom" && (
-								<>
-									<div className="menu-divider" />
-									<div
-										className="menu-item quit"
-										onClick={() => removeExtraFromDock(contextMenu.extra!)}
-									>
-										Remove from Dock
-									</div>
-								</>
-							)}
-						</>
-					) : contextMenu.taskView ? (
-						<>
-							<div
-								className="menu-item"
-								onClick={() => {
-									closeMenu();
-									openTaskView();
-								}}
-							>
-								Open Task View
-							</div>
-							<div className="menu-divider" />
-							<div className="menu-item" onClick={hideTaskView}>
-								Hide Task View
-							</div>
-						</>
-					) : contextMenu.app ? (
-						<>
-							<div className="menu-item" onClick={() => togglePin(contextMenu.app!)}>
-								{contextMenu.app.is_pinned ? "Unpin from Dock" : "Pin to Dock"}
-							</div>
-							{contextMenu.app.is_pinned && contextMenu.app.path !== "start" && (
-								<>
-									<div className="menu-divider" />
-									<div
-										className="menu-item"
-										onClick={() => {
+							</>
+						) : contextMenu.app ? (
+							<>
+								<div className="menu-item" onClick={() => togglePin(contextMenu.app!)}>
+									{contextMenu.app.is_pinned ? "Unpin from Dock" : "Pin to Dock"}
+								</div>
+								{contextMenu.app.is_pinned && contextMenu.app.path !== "start" && (
+									<>
+										<div className="menu-divider" />
+										<div
+											className="menu-item"
+											onClick={() => {
+												const isHost = isBrowserHost(contextMenu.app!.path);
+												const ck = isHost
+													? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}`
+													: contextMenu.app!.path;
+												iconPickerTargetRef.current = ck;
+												closeMenu();
+												setTimeout(() => {
+													document.getElementById("icon-file-input")?.click();
+												}, 50);
+											}}
+										>
+											Change Icon...
+										</div>
+										{(() => {
 											const isHost = isBrowserHost(contextMenu.app!.path);
 											const ck = isHost
 												? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}`
 												: contextMenu.app!.path;
-											iconPickerTargetRef.current = ck;
-											closeMenu();
-											setTimeout(() => {
-												document.getElementById("icon-file-input")?.click();
-											}, 50);
-										}}
-									>
-										Change Icon...
-									</div>
-									{(() => {
-										const isHost = isBrowserHost(contextMenu.app!.path);
-										const ck = isHost
-											? `${contextMenu.app!.path}:${contextMenu.app!.name.toLowerCase()}`
-											: contextMenu.app!.path;
-										return customIcons[ck] ? (
-											<div
-												className="menu-item"
-												onClick={() => {
-													handleRemoveCustomIcon(contextMenu.app!);
-													closeMenu();
-												}}
-											>
-												Reset Icon
-											</div>
-										) : null;
-									})()}
-								</>
-							)}
-							<div className="menu-divider" />
-							<div
-								className="menu-item"
-								onClick={() => {
-									setShowAddPopup(true);
-									closeMenu();
-								}}
-							>
-								Add App to Dock...
-							</div>
-							<div
-								className="menu-item has-submenu"
-								onMouseEnter={() => setActiveSubmenu("bloom")}
-								onMouseLeave={() => setActiveSubmenu(null)}
-							>
-								Bloom Options
-								<span className="submenu-arrow">▶</span>
-								<div className="submenu">
-									<div
-										className="menu-item"
-										onClick={() => {
-											invoke("open_settings_window");
-											closeMenu();
-										}}
-									>
-										Open Settings
-									</div>
-									<div className="menu-item" onClick={() => invoke("restart_bloom")}>
-										Restart Bloom
-									</div>
-									<div
-										className="menu-item"
-										onClick={() => {
-											handleClearIconCache();
-											closeMenu();
-										}}
-									>
-										Clear Icon Cache
-									</div>
-									<div className="menu-divider" />
-									<div className="menu-item quit" onClick={() => invoke("quit_bloom")}>
-										Quit Bloom
-									</div>
-								</div>
-							</div>
-							{(() => {
-								// App actions sit together just above Close, like the taskbar's
-								// jump list: the app's tray menus, then a new instance.
-								const app = contextMenu.app!;
-								const canOpenNew = app.is_running && app.path !== "start";
-								if (!app.tray_ids?.length && !canOpenNew) return null;
-								return (
-									<>
-										<div className="menu-divider" />
-										{app.tray_ids?.map((id, index, ids) => (
-											<div key={id} className="menu-item" onClick={() => void openTrayMenu(id)}>
-												{ids.length > 1 ? `Tray menu ${index + 1}` : "App tray menu"}
-											</div>
-										))}
-										{canOpenNew && (
-											<div
-												className="menu-item"
-												onClick={() => {
-													handleNewInstance(app);
-													closeMenu();
-												}}
-											>
-												Open New Instance
-											</div>
-										)}
+											return customIcons[ck] ? (
+												<div
+													className="menu-item"
+													onClick={() => {
+														handleRemoveCustomIcon(contextMenu.app!);
+														closeMenu();
+													}}
+												>
+													Reset Icon
+												</div>
+											) : null;
+										})()}
 									</>
-								);
-							})()}
-							{contextMenu.app.is_running && !contextMenu.app.is_background && (
-								<>
-									{contextMenu.app.path === "start" && !contextMenu.app.tray_ids?.length && (
+								)}
+								<div className="menu-divider" />
+								<div
+									className="menu-item"
+									onClick={() => {
+										closeMenu();
+										setActivePanel("add");
+									}}
+								>
+									Add App to Dock...
+								</div>
+								<div
+									className="menu-item has-submenu"
+									onMouseEnter={() => setActiveSubmenu("bloom")}
+									onMouseLeave={() => setActiveSubmenu(null)}
+								>
+									Bloom Options
+									<span className="submenu-arrow">▶</span>
+									<div className="submenu">
+										<div
+											className="menu-item"
+											onClick={() => {
+												invoke("open_settings_window");
+												closeMenu();
+											}}
+										>
+											Open Settings
+										</div>
+										<div className="menu-item" onClick={() => invoke("restart_bloom")}>
+											Restart Bloom
+										</div>
+										<div
+											className="menu-item"
+											onClick={() => {
+												handleClearIconCache();
+												closeMenu();
+											}}
+										>
+											Clear Icon Cache
+										</div>
 										<div className="menu-divider" />
-									)}
-									<div
-										className="menu-item quit"
-										onClick={async () => {
-											// Close every window of the item, like the taskbar's
-											// "Close all windows", not just the first one.
-											const app = contextMenu.app;
-											const hwnds =
-												app?.all_hwnds?.map(([hwnd]) => hwnd) ?? (app?.hwnd ? [app.hwnd] : []);
-											await Promise.all(hwnds.map((hwnd) => invoke("close_window", { hwnd })));
-											closeMenu();
-										}}
-									>
-										Close{" "}
-										{contextMenu.app.all_hwnds && contextMenu.app.all_hwnds.length > 1
-											? "all windows"
-											: "window"}
-									</div>
-								</>
-							)}
-						</>
-					) : (
-						<>
-							<div
-								className="menu-item"
-								onClick={() => {
-									setShowAddPopup(true);
-									closeMenu();
-								}}
-							>
-								Add App to Dock...
-							</div>
-							<div
-								className="menu-item has-submenu"
-								onMouseEnter={() => setActiveSubmenu("bloom")}
-								onMouseLeave={() => setActiveSubmenu(null)}
-							>
-								Bloom Options
-								<span className="submenu-arrow">▶</span>
-								<div className="submenu">
-									<div
-										className="menu-item"
-										onClick={() => {
-											invoke("open_settings_window");
-											closeMenu();
-										}}
-									>
-										Open Settings
-									</div>
-									<div className="menu-item" onClick={() => invoke("restart_bloom")}>
-										Restart Bloom
-									</div>
-									<div
-										className="menu-item"
-										onClick={() => {
-											handleClearIconCache();
-											closeMenu();
-										}}
-									>
-										Clear Icon Cache
-									</div>
-									<div className="menu-divider" />
-									<div className="menu-item quit" onClick={() => invoke("quit_bloom")}>
-										Quit Bloom
+										<div className="menu-item quit" onClick={() => invoke("quit_bloom")}>
+											Quit Bloom
+										</div>
 									</div>
 								</div>
-							</div>
-						</>
-					)}
-				</div>
-			)}
+								{(() => {
+									const app = contextMenu.app!;
+									const canOpenNew = app.is_running && app.path !== "start";
+									if (!app.tray_ids?.length && !canOpenNew) return null;
+									return (
+										<>
+											<div className="menu-divider" />
+											{app.tray_ids?.map((id, index, ids) => (
+												<div key={id} className="menu-item" onClick={() => void openTrayMenu(id)}>
+													{ids.length > 1 ? `Tray menu ${index + 1}` : "App tray menu"}
+												</div>
+											))}
+											{canOpenNew && (
+												<div
+													className="menu-item"
+													onClick={() => {
+														handleNewInstance(app);
+														closeMenu();
+													}}
+												>
+													Open New Instance
+												</div>
+											)}
+										</>
+									);
+								})()}
+								{contextMenu.app.is_running && !contextMenu.app.is_background && (
+									<>
+										{contextMenu.app.path === "start" && !contextMenu.app.tray_ids?.length && (
+											<div className="menu-divider" />
+										)}
+										<div
+											className="menu-item quit"
+											onClick={async () => {
+												const app = contextMenu.app;
+												const hwnds =
+													app?.all_hwnds?.map(([hwnd]) => hwnd) ?? (app?.hwnd ? [app.hwnd] : []);
+												await Promise.all(hwnds.map((hwnd) => invoke("close_window", { hwnd })));
+												closeMenu();
+											}}
+										>
+											Close{" "}
+											{contextMenu.app.all_hwnds && contextMenu.app.all_hwnds.length > 1
+												? "all windows"
+												: "window"}
+										</div>
+									</>
+								)}
+							</>
+						) : (
+							<>
+								<div
+									className="menu-item"
+									onClick={() => {
+										closeMenu();
+										setActivePanel("add");
+									}}
+								>
+									Add App to Dock...
+								</div>
+								<div
+									className="menu-item has-submenu"
+									onMouseEnter={() => setActiveSubmenu("bloom")}
+									onMouseLeave={() => setActiveSubmenu(null)}
+								>
+									Bloom Options
+									<span className="submenu-arrow">▶</span>
+									<div className="submenu">
+										<div
+											className="menu-item"
+											onClick={() => {
+												invoke("open_settings_window");
+												closeMenu();
+											}}
+										>
+											Open Settings
+										</div>
+										<div className="menu-item" onClick={() => invoke("restart_bloom")}>
+											Restart Bloom
+										</div>
+										<div
+											className="menu-item"
+											onClick={() => {
+												handleClearIconCache();
+												closeMenu();
+											}}
+										>
+											Clear Icon Cache
+										</div>
+										<div className="menu-divider" />
+										<div className="menu-item quit" onClick={() => invoke("quit_bloom")}>
+											Quit Bloom
+										</div>
+									</div>
+								</div>
+							</>
+						)}
+					</motion.div>
+				)}
+			</AnimatePresence>
 
 			<input
 				id="icon-file-input"
@@ -2159,102 +2467,6 @@ const Dock = memo(function Dock() {
 				style={{ display: "none" }}
 				onChange={handleIconFileSelect}
 			/>
-
-			<AnimatePresence>
-				{showTrayPopup && (
-					<div className="add-popup-anchor" style={{ zoom: scale, bottom: popupBottom }}>
-						<motion.div
-							ref={trayPopupRef}
-							className="tray-overflow-popup"
-							initial={{ opacity: 0, y: 12 }}
-							animate={{ opacity: 1, y: 0 }}
-							exit={{ opacity: 0, y: 8 }}
-							transition={{ duration: 0.16 }}
-							onClick={(e) => e.stopPropagation()}
-						>
-							<div className="tray-overflow-header">
-								<span>Applications en arrière-plan</span>
-								<button
-									type="button"
-									className="tray-refresh"
-									aria-label="Actualiser les applications"
-									onClick={() => {
-										setTrayLoading(true);
-										invoke<TrayApp[]>("get_tray_apps")
-											.then((items) => setTrayItems(items.filter((app) => app.tray_ids.length > 0)))
-											.catch(showActionError)
-											.finally(() => setTrayLoading(false));
-									}}
-								>
-									<RefreshCw size={15} />
-								</button>
-							</div>
-							<div className="tray-overflow-list">
-								{trayLoading && trayItems.length === 0 ? (
-									<div className="tray-empty">Chargement des applications…</div>
-								) : trayItems.length === 0 ? (
-									<div className="tray-empty">Aucune icône de notification détectée.</div>
-								) : trayItems.map((app) => (
-									<div key={app.path} className="tray-overflow-row">
-										<button
-											type="button"
-											className="tray-overflow-app"
-											aria-label={`Ouvrir ${app.name}`}
-											onClick={() => {
-												setShowTrayPopup(false);
-												invoke("activate_tray_icon", { trayId: app.tray_ids[0] }).catch(showActionError);
-											}}
-										>
-											{trayIcons[app.path] ? (
-												<img src={trayIcons[app.path]} alt="" draggable={false} />
-											) : (
-												<span className="tray-overflow-initial">{app.name.charAt(0)}</span>
-											)}
-											<span className="tray-overflow-name">{app.name}</span>
-										</button>
-										<button
-											type="button"
-											className="tray-overflow-actions"
-											title={`Options de ${app.name} (Quitter, paramètres…)`}
-											aria-label={`Options de ${app.name}`}
-											onClick={() => {
-												setShowTrayPopup(false);
-												void openTrayMenu(app.tray_ids[0]);
-											}}
-										>
-											<MoreHorizontal size={18} />
-										</button>
-									</div>
-								))}
-							</div>
-							<div className="tray-overflow-footer">
-								<button type="button" onClick={() => {
-									setShowTrayPopup(false);
-									invoke("open_system_action", { action: "task-manager" }).catch(showActionError);
-								}}>Gestionnaire des tâches</button>
-								<span>Les options « Quitter » dépendent de chaque application.</span>
-							</div>
-						</motion.div>
-					</div>
-				)}
-			</AnimatePresence>
-
-			<AnimatePresence>
-				{showAddPopup && (
-					<AddAppPopup
-						containerRef={popupRef}
-						onClose={closePopup}
-						onAdd={(app: AppInfo) => {
-							togglePin(app);
-							closePopup();
-						}}
-						scale={scale}
-						runningApps={activeApps}
-						pinned={pinnedApps}
-						bottom={popupBottom}
-					/>
-				)}
-			</AnimatePresence>
 
 			<AnimatePresence>
 				{toast && (
@@ -2274,32 +2486,725 @@ const Dock = memo(function Dock() {
 	);
 });
 
-function AddAppPopup({
-	onClose,
-	onAdd,
-	containerRef,
-	scale,
-	runningApps,
-	pinned,
-	bottom
+/**
+ * Integrated Start Menu inside the stretched Dynamic Island Dock.
+ * Contains:
+ * - Search bar at the top,
+ * - Pinned / primary apps grid with real icons,
+ * - "Toutes les applications >" button switching to the complete alphabetical list,
+ * - Bottom bar (just above the Dock icons) with the user profile and Power menu (Arrêter, Redémarrer, Veille, Verrouiller).
+ */
+function DockStartMenuPanel({
+	panelRef,
+	pinnedApps,
+	installedApps,
+	customIcons,
+	cachedIcons,
+	currentUser,
+	onLaunchApp,
+	onSystemAction,
+	onClose
 }: {
+	panelRef: React.RefObject<HTMLDivElement | null>;
+	pinnedApps: AppInfo[];
+	installedApps: AppInfo[];
+	customIcons: Record<string, string>;
+	cachedIcons: Record<string, string>;
+	currentUser: string;
+	onLaunchApp: (app: AppInfo) => void;
+	onSystemAction: (action: string) => void;
 	onClose: () => void;
-	onAdd: (app: AppInfo) => void;
-	containerRef: React.RefObject<HTMLDivElement | null>;
-	scale: number;
-	runningApps: AppInfo[];
-	pinned: AppInfo[];
-	bottom: number;
 }) {
-	const [apps, setApps] = useState<AppInfo[]>([]);
+	const [apps, setApps] = useState<AppInfo[]>(installedApps);
 	const [search, setSearch] = useState("");
-	const [debouncedSearch, setDebouncedSearch] = useState("");
-	const [loading, setLoading] = useState(true);
+	const [allAppsView, setAllAppsView] = useState(false);
+	const [powerMenuOpen, setPowerMenuOpen] = useState(false);
+	const [listIcons, setListIcons] = useState<Record<string, string>>({});
+	const inputRef = useRef<HTMLInputElement>(null);
+
+	useEffect(() => {
+		if (installedApps.length > 0) {
+			setApps(installedApps);
+			return;
+		}
+		let active = true;
+		invoke<AppInfo[]>("get_installed_apps")
+			.then((res) => {
+				if (active) setApps(res.sort((a, b) => a.name.localeCompare(b.name)));
+			})
+			.catch(() => {});
+		return () => {
+			active = false;
+		};
+	}, [installedApps]);
+
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") {
+				if (powerMenuOpen) {
+					setPowerMenuOpen(false);
+				} else if (allAppsView && !search.trim()) {
+					setAllAppsView(false);
+				} else {
+					onClose();
+				}
+			}
+		};
+		window.addEventListener("keydown", handleKeyDown);
+		return () => window.removeEventListener("keydown", handleKeyDown);
+	}, [onClose, powerMenuOpen, allAppsView, search]);
+
+	// Primary pinned grid (up to 18 apps: user pinned apps first, then popular installed apps).
+	const primaryGridApps = useMemo(() => {
+		const out: AppInfo[] = [...pinnedApps];
+		for (const inst of apps) {
+			if (out.length >= 18) break;
+			if (inst.path === "start") continue;
+			if (!out.some((p) => isSameApp(p, inst))) {
+				out.push(inst);
+			}
+		}
+		return out.slice(0, 18);
+	}, [pinnedApps, apps]);
+
+	const filteredApps = useMemo(() => {
+		const q = search.trim().toLowerCase();
+		const base = apps.filter((a) => a.path !== "start");
+		if (!q) return base;
+		return base
+			.filter((a) => a.name.toLowerCase().includes(q))
+			.sort((x, y) => {
+				const xs = x.name.toLowerCase().startsWith(q) ? 0 : 1;
+				const ys = y.name.toLowerCase().startsWith(q) ? 0 : 1;
+				return xs - ys || x.name.localeCompare(y.name);
+			});
+	}, [apps, search]);
+
+	const alphabeticalGroups = useMemo(() => {
+		const groups = new Map<string, AppInfo[]>();
+		for (const app of filteredApps) {
+			const firstChar = app.name.trim().charAt(0).toUpperCase();
+			const letter = /[A-Z]/.test(firstChar) ? firstChar : "#";
+			const list = groups.get(letter) ?? [];
+			list.push(app);
+			groups.set(letter, list);
+		}
+		return Array.from(groups.entries()).sort(([a], [b]) => {
+			if (a === "#") return -1;
+			if (b === "#") return 1;
+			return a.localeCompare(b);
+		});
+	}, [filteredApps]);
+
+	const resolveAppIcon = (app: AppInfo) => {
+		const brand = cleanBrandIcon(app);
+		return (
+			customIcons[app.path] ||
+			brand ||
+			cachedIcons[app.path] ||
+			listIcons[app.path] ||
+			app.icon
+		);
+	};
+
+	useEffect(() => {
+		let active = true;
+		const visiblePool =
+			allAppsView || search.trim() ? filteredApps.slice(0, 48) : primaryGridApps;
+		const missing = visiblePool.filter((a) => !resolveAppIcon(a));
+		if (missing.length === 0) return;
+
+		Promise.all(
+			missing.map(async (app) => {
+				try {
+					const icon = await invoke<string | null>("get_app_icon", { path: app.path });
+					return [app.path, icon] as const;
+				} catch {
+					return [app.path, null] as const;
+				}
+			})
+		).then((pairs) => {
+			if (!active) return;
+			const batch: Record<string, string> = {};
+			for (const [path, icon] of pairs) if (icon) batch[path] = icon;
+			if (Object.keys(batch).length > 0) {
+				setListIcons((prev) => ({ ...prev, ...batch }));
+			}
+		});
+		return () => {
+			active = false;
+		};
+	}, [allAppsView, search, filteredApps, primaryGridApps]);
+
+	const showListMode = allAppsView || search.trim().length > 0;
+
+	return (
+		<motion.div
+			ref={panelRef}
+			className="dock-island-panel dock-start-panel"
+			initial={{ opacity: 0, y: 12 }}
+			animate={{ opacity: 1, y: 0 }}
+			exit={{ opacity: 0, y: 8, transition: { duration: 0.12 } }}
+			transition={{ duration: 0.2, ease: "easeOut" }}
+			onClick={() => {
+				if (powerMenuOpen) setPowerMenuOpen(false);
+			}}
+		>
+			{/* Top Search Bar */}
+			<div className="start-search-bar">
+				<Search className="popup-search-icon" size={16} aria-hidden="true" />
+				<input
+					ref={inputRef}
+					type="text"
+					className="popup-search-input dock-search-input"
+					placeholder="Rechercher des applications, paramètres et documents…"
+					value={search}
+					onChange={(e) => setSearch(e.target.value)}
+					onKeyDown={(e) => {
+						if (e.key === "Enter" && filteredApps.length > 0) {
+							onLaunchApp(filteredApps[0]);
+						}
+					}}
+				/>
+				{search && (
+					<button
+						type="button"
+						className="start-search-clear"
+						onClick={() => setSearch("")}
+					>
+						Effacer
+					</button>
+				)}
+			</div>
+
+			{/* Section Header */}
+			<div className="start-section-header">
+				<span className="start-section-title">
+					{search.trim()
+						? `Résultats (${filteredApps.length})`
+						: allAppsView
+							? "Toutes les applications"
+							: "Épinglé"}
+				</span>
+				{!search.trim() && (
+					<button
+						type="button"
+						className="start-all-apps-btn"
+						onClick={() => setAllAppsView((v) => !v)}
+					>
+						{allAppsView ? (
+							<>
+								<ChevronLeft size={14} />
+								<span>Retour</span>
+							</>
+						) : (
+							<>
+								<span>Toutes les applications</span>
+								<ChevronRight size={14} />
+							</>
+						)}
+					</button>
+				)}
+			</div>
+
+			{/* Main Content Area: Pinned Grid OR Alphabetical All-Apps List */}
+			<div className="start-body-scroll">
+				{!showListMode ? (
+					<div className="start-pinned-grid">
+						{primaryGridApps.map((app) => {
+							const icon = resolveAppIcon(app);
+							return (
+								<button
+									key={`${app.path}::${app.name}`}
+									type="button"
+									className="start-grid-item"
+									onClick={() => onLaunchApp(app)}
+									title={app.name}
+								>
+									<div className="start-grid-icon">
+										{icon ? (
+											<img src={icon} alt="" draggable={false} />
+										) : (
+											<span className="start-grid-initial">{app.name.charAt(0)}</span>
+										)}
+									</div>
+									<span className="start-grid-name">{app.name}</span>
+								</button>
+							);
+						})}
+					</div>
+				) : filteredApps.length === 0 ? (
+					<div className="popup-empty">
+						Aucune application trouvée pour « {search.trim()} »
+					</div>
+				) : (
+					<div className="start-alpha-list">
+						{alphabeticalGroups.map(([letter, items]) => (
+							<div key={letter} className="start-alpha-group">
+								<div className="start-alpha-letter">{letter}</div>
+								{items.map((app) => {
+									const icon = resolveAppIcon(app);
+									return (
+										<button
+											key={`${app.path}::${app.name}`}
+											type="button"
+											className="start-alpha-row"
+											onClick={() => onLaunchApp(app)}
+										>
+											<div className="start-alpha-icon">
+												{icon ? (
+													<img src={icon} alt="" draggable={false} />
+												) : (
+													<span className="popup-app-initial">{app.name.charAt(0)}</span>
+												)}
+											</div>
+											<span className="start-alpha-name">{app.name}</span>
+										</button>
+									);
+								})}
+							</div>
+						))}
+					</div>
+				)}
+			</div>
+
+			{/* Bottom Bar: User Profile & Power Menu (just above the Dock icons) */}
+			<div className="start-footer-bar">
+				<button
+					type="button"
+					className="start-user-badge"
+					onClick={() => onSystemAction("settings")}
+					title="Ouvrir les paramètres du compte Windows"
+				>
+					<div className="start-user-avatar">
+						<User size={15} />
+					</div>
+					<span className="start-user-name">{currentUser}</span>
+				</button>
+
+				<div className="start-power-wrapper" onClick={(e) => e.stopPropagation()}>
+					<AnimatePresence>
+						{powerMenuOpen && (
+							<motion.div
+								className="start-power-popover"
+								initial={{ opacity: 0, y: 8, scale: 0.95 }}
+								animate={{ opacity: 1, y: 0, scale: 1 }}
+								exit={{ opacity: 0, y: 8, scale: 0.95 }}
+								transition={{ duration: 0.14 }}
+							>
+								<button
+									type="button"
+									className="start-power-option"
+									onClick={() => onSystemAction("lock")}
+								>
+									<Lock size={14} />
+									<span>Verrouiller</span>
+								</button>
+								<button
+									type="button"
+									className="start-power-option"
+									onClick={() => onSystemAction("sleep")}
+								>
+									<Moon size={14} />
+									<span>Mise en veille</span>
+								</button>
+								<button
+									type="button"
+									className="start-power-option"
+									onClick={() => onSystemAction("restart")}
+								>
+									<RotateCcw size={14} />
+									<span>Redémarrer</span>
+								</button>
+								<button
+									type="button"
+									className="start-power-option start-power-danger"
+									onClick={() => onSystemAction("shutdown")}
+								>
+									<Power size={14} />
+									<span>Arrêter</span>
+								</button>
+							</motion.div>
+						)}
+					</AnimatePresence>
+					<button
+						type="button"
+						className={`start-power-btn${powerMenuOpen ? " is-open" : ""}`}
+						title="Marche/Arrêt"
+						aria-label="Marche/Arrêt"
+						aria-expanded={powerMenuOpen}
+						onClick={() => setPowerMenuOpen((v) => !v)}
+					>
+						<Power size={16} />
+					</button>
+				</div>
+			</div>
+		</motion.div>
+	);
+}
+
+/**
+ * Large-format Search integrated inside the stretched Dynamic Island Dock.
+ */
+function DockSearchPanel({
+	panelRef,
+	runningApps,
+	installedApps,
+	onLaunchApp,
+	onNativeWindowsSearch,
+	onClose
+}: {
+	panelRef: React.RefObject<HTMLDivElement | null>;
+	runningApps: AppInfo[];
+	installedApps: AppInfo[];
+	onLaunchApp: (app: AppInfo) => void;
+	onNativeWindowsSearch: () => void;
+	onClose: () => void;
+}) {
+	const [apps, setApps] = useState<AppInfo[]>(installedApps);
+	const [search, setSearch] = useState("");
+	const [loading, setLoading] = useState(installedApps.length === 0);
 	const [listIcons, setListIcons] = useState<Record<string, string>>({});
 	const [selectedIndex, setSelectedIndex] = useState(0);
 	const inputRef = useRef<HTMLInputElement>(null);
 	const listRef = useRef<HTMLDivElement>(null);
-	const mountedRef = useRef(false);
+
+	useEffect(() => {
+		inputRef.current?.focus();
+	}, []);
+
+	useEffect(() => {
+		if (installedApps.length > 0) {
+			setApps(installedApps);
+			setLoading(false);
+			return;
+		}
+		let mounted = true;
+		invoke<AppInfo[]>("get_installed_apps")
+			.then((res) => {
+				if (mounted) {
+					setApps(res.sort((a, b) => a.name.localeCompare(b.name)));
+				}
+			})
+			.finally(() => {
+				if (mounted) setLoading(false);
+			});
+		return () => {
+			mounted = false;
+		};
+	}, [installedApps]);
+
+	const sections = useMemo(() => {
+		const q = search.trim().toLowerCase();
+		const active = runningApps.filter(
+			(a) => a.path !== "start" && (!q || a.name.toLowerCase().includes(q))
+		);
+		const activeKeys = new Set(active.map((a) => itemKey(a)));
+		const installed = apps
+			.filter(
+				(a) =>
+					a.path !== "start" &&
+					!activeKeys.has(itemKey(a)) &&
+					(!q || a.name.toLowerCase().includes(q))
+			)
+			.sort((x, y) => {
+				if (!q) return x.name.localeCompare(y.name);
+				const xs = x.name.toLowerCase().startsWith(q) ? 0 : 1;
+				const ys = y.name.toLowerCase().startsWith(q) ? 0 : 1;
+				return xs - ys || x.name.localeCompare(y.name);
+			})
+			.slice(0, q ? 36 : 24);
+
+		const out: { title: string; items: AppInfo[]; isRunning?: boolean }[] = [];
+		if (active.length > 0) {
+			out.push({ title: "Fenêtres actives", items: active.slice(0, 10), isRunning: true });
+		}
+		if (installed.length > 0) {
+			out.push({ title: "Applications", items: installed });
+		}
+		return out;
+	}, [apps, runningApps, search]);
+
+	const flat = useMemo(() => sections.flatMap((s) => s.items), [sections]);
+	const flatIndex = useMemo(() => new Map(flat.map((a, i) => [a, i])), [flat]);
+
+	useEffect(() => {
+		setSelectedIndex(0);
+	}, [search]);
+
+	useEffect(() => {
+		if (!listRef.current) return;
+		const row = listRef.current.querySelector(
+			`[data-idx="${selectedIndex}"]`
+		) as HTMLElement | null;
+		if (row) row.scrollIntoView({ block: "nearest" });
+	}, [selectedIndex]);
+
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") {
+				onClose();
+				return;
+			}
+			if (e.key === "ArrowDown") {
+				e.preventDefault();
+				setSelectedIndex((i) => Math.min(i + 1, Math.max(0, flat.length - 1)));
+			} else if (e.key === "ArrowUp") {
+				e.preventDefault();
+				setSelectedIndex((i) => Math.max(i - 1, 0));
+			} else if (e.key === "Enter") {
+				e.preventDefault();
+				if (e.ctrlKey || e.metaKey || flat.length === 0) {
+					onNativeWindowsSearch();
+					return;
+				}
+				const target = flat[selectedIndex];
+				if (target) onLaunchApp(target);
+			}
+		};
+		window.addEventListener("keydown", handleKeyDown);
+		return () => window.removeEventListener("keydown", handleKeyDown);
+	}, [onClose, flat, selectedIndex, onLaunchApp, onNativeWindowsSearch]);
+
+	useEffect(() => {
+		let active = true;
+		const targets = flat.slice(0, 28).filter((a) => !listIcons[a.path]);
+		if (targets.length === 0) return;
+		Promise.all(
+			targets.map(async (app) => {
+				try {
+					const brand = cleanBrandIcon(app);
+					if (brand) return [app.path, brand] as const;
+					const icon = await invoke<string | null>("get_app_icon", { path: app.path });
+					return [app.path, icon] as const;
+				} catch {
+					return [app.path, null] as const;
+				}
+			})
+		).then((pairs) => {
+			if (!active) return;
+			const batch: Record<string, string> = {};
+			for (const [path, icon] of pairs) if (icon) batch[path] = icon;
+			if (Object.keys(batch).length > 0) setListIcons((prev) => ({ ...prev, ...batch }));
+		});
+		return () => {
+			active = false;
+		};
+	}, [flat, listIcons]);
+
+	return (
+		<motion.div
+			ref={panelRef}
+			className="dock-island-panel dock-search-panel"
+			initial={{ opacity: 0, y: 12 }}
+			animate={{ opacity: 1, y: 0 }}
+			exit={{ opacity: 0, y: 8, transition: { duration: 0.12 } }}
+			transition={{ duration: 0.2, ease: "easeOut" }}
+		>
+			<div className="popup-search-row dock-search-header">
+				<Search className="popup-search-icon" size={16} aria-hidden="true" />
+				<input
+					ref={inputRef}
+					type="text"
+					className="popup-search-input dock-search-input"
+					placeholder="Rechercher une application, une fenêtre ou sur Windows…"
+					value={search}
+					onChange={(e) => setSearch(e.target.value)}
+				/>
+				<span className="dock-search-kbd">Entrée</span>
+			</div>
+			<div className="popup-apps-scroll dock-search-results" ref={listRef}>
+				{loading && flat.length === 0 ? (
+					<div className="popup-empty">Chargement de l’index des applications…</div>
+				) : flat.length > 0 ? (
+					sections.map((sec) => (
+						<div key={sec.title}>
+							<div className="popup-section-label">{sec.title}</div>
+							{sec.items.map((app) => {
+								const gi = flatIndex.get(app) ?? 0;
+								const icon = cleanBrandIcon(app) || listIcons[app.path] || app.icon;
+								return (
+									<div
+										key={`${app.path}::${app.name}`}
+										data-idx={gi}
+										className={`popup-app-row${gi === selectedIndex ? " selected" : ""}`}
+										onClick={() => onLaunchApp(app)}
+										onMouseEnter={() => setSelectedIndex(gi)}
+									>
+										<div className="popup-app-icon">
+											{icon ? (
+												<img src={icon} alt="" draggable={false} />
+											) : (
+												<span className="popup-app-initial">{app.name[0]}</span>
+											)}
+										</div>
+										<span className="popup-app-name">{app.name}</span>
+										{sec.isRunning ? (
+											<span className="dock-search-badge">Actif</span>
+										) : (
+											<span className="dock-search-open-hint">Ouvrir ↵</span>
+										)}
+									</div>
+								);
+							})}
+						</div>
+					))
+				) : (
+					<div className="popup-empty">
+						Aucune application locale pour « {search.trim()} » — appuyez sur Entrée pour rechercher sur Windows
+					</div>
+				)}
+			</div>
+			<div className="dock-search-footer">
+				<button
+					type="button"
+					className="dock-search-win-btn"
+					onClick={onNativeWindowsSearch}
+				>
+					<Search size={13} aria-hidden="true" />
+					<span>Recherche Windows approfondie (Win+S)</span>
+				</button>
+			</div>
+		</motion.div>
+	);
+}
+
+/**
+ * Integrated System Tray Grid inside the stretched Dynamic Island Dock.
+ * Displays notification icons directly in Bloom's dark theme (no grey Windows popup).
+ */
+function DockTrayPanel({
+	panelRef,
+	trayItems,
+	trayIcons,
+	trayLoading,
+	onRefresh,
+	onActivate,
+	onContextMenu,
+	onOpenTaskManager,
+	onClose
+}: {
+	panelRef: React.RefObject<HTMLDivElement | null>;
+	trayItems: TrayApp[];
+	trayIcons: Record<string, string>;
+	trayLoading: boolean;
+	onRefresh: () => void;
+	onActivate: (trayId: string) => void;
+	onContextMenu: (trayId: string) => void;
+	onOpenTaskManager: () => void;
+	onClose: () => void;
+}) {
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") onClose();
+		};
+		window.addEventListener("keydown", handleKeyDown);
+		return () => window.removeEventListener("keydown", handleKeyDown);
+	}, [onClose]);
+
+	return (
+		<motion.div
+			ref={panelRef}
+			className="dock-island-panel dock-tray-panel"
+			initial={{ opacity: 0, y: 12 }}
+			animate={{ opacity: 1, y: 0 }}
+			exit={{ opacity: 0, y: 8, transition: { duration: 0.12 } }}
+			transition={{ duration: 0.2, ease: "easeOut" }}
+		>
+			<div className="tray-overflow-header">
+				<span>Applications en arrière-plan</span>
+				<button
+					type="button"
+					className="tray-refresh"
+					aria-label="Actualiser les applications"
+					onClick={onRefresh}
+				>
+					<RefreshCw size={15} />
+				</button>
+			</div>
+			<div className="tray-grid-scroll">
+				{trayLoading && trayItems.length === 0 ? (
+					<div className="tray-empty">Chargement des icônes de notification…</div>
+				) : trayItems.length === 0 ? (
+					<div className="tray-empty">Aucune application en arrière-plan détectée.</div>
+				) : (
+					<div className="tray-icon-grid">
+						{trayItems.map((app) => {
+							const iconSrc = app.icon || trayIcons[app.path];
+							return (
+								<div
+									key={app.path}
+									className="tray-grid-card"
+									title={`${app.name} — Clic gauche : ouvrir • Clic droit : options`}
+									onClick={() => onActivate(app.tray_ids[0])}
+									onContextMenu={(e) => {
+										e.preventDefault();
+										e.stopPropagation();
+										onContextMenu(app.tray_ids[0]);
+									}}
+								>
+									<div className="tray-grid-icon-box">
+										{iconSrc ? (
+											<img src={iconSrc} alt="" draggable={false} />
+										) : (
+											<span className="tray-overflow-initial">{app.name.charAt(0)}</span>
+										)}
+									</div>
+									<span className="tray-grid-label">{app.name}</span>
+									<button
+										type="button"
+										className="tray-grid-more"
+										title={`Menu contextuel de ${app.name}`}
+										aria-label={`Menu contextuel de ${app.name}`}
+										onClick={(e) => {
+											e.stopPropagation();
+											onContextMenu(app.tray_ids[0]);
+										}}
+									>
+										<MoreHorizontal size={13} />
+									</button>
+								</div>
+							);
+						})}
+					</div>
+				)}
+			</div>
+			<div className="tray-overflow-footer">
+				<button type="button" onClick={onOpenTaskManager}>
+					Gestionnaire des tâches
+				</button>
+				<span>Clic gauche : ouvrir • Clic droit : menu</span>
+			</div>
+		</motion.div>
+	);
+}
+
+/**
+ * Integrated Add-App panel inside the stretched Dynamic Island Dock.
+ */
+function DockAddAppPanel({
+	panelRef,
+	runningApps,
+	installedApps,
+	pinned,
+	onAdd,
+	onClose
+}: {
+	panelRef: React.RefObject<HTMLDivElement | null>;
+	runningApps: AppInfo[];
+	installedApps: AppInfo[];
+	pinned: AppInfo[];
+	onAdd: (app: AppInfo) => void;
+	onClose: () => void;
+}) {
+	const [apps, setApps] = useState<AppInfo[]>(installedApps);
+	const [search, setSearch] = useState("");
+	const [debouncedSearch, setDebouncedSearch] = useState("");
+	const [loading, setLoading] = useState(installedApps.length === 0);
+	const [listIcons, setListIcons] = useState<Record<string, string>>({});
+	const [selectedIndex, setSelectedIndex] = useState(0);
+	const inputRef = useRef<HTMLInputElement>(null);
+	const listRef = useRef<HTMLDivElement>(null);
 
 	useEffect(() => {
 		const timer = setTimeout(() => setDebouncedSearch(search), 150);
@@ -2310,15 +3215,27 @@ function AddAppPopup({
 		inputRef.current?.focus();
 	}, []);
 
-	// Reset selection when search changes
 	useEffect(() => {
 		setSelectedIndex(0);
 	}, [debouncedSearch]);
 
-	// Running, unpinned apps — already in memory, so the default view is
-	// instant and relevant instead of the first 20 alphabetical installs.
-	// Pinned matching is fuzzy: a pinned .lnk and its running .exe are the
-	// same app and must not show up as pinnable again.
+	useEffect(() => {
+		if (installedApps.length > 0) {
+			setApps(installedApps);
+			setLoading(false);
+			return;
+		}
+		const load = async () => {
+			try {
+				const res = await invoke<AppInfo[]>("get_installed_apps");
+				setApps(res.sort((a, b) => a.name.localeCompare(b.name)));
+			} finally {
+				setLoading(false);
+			}
+		};
+		load();
+	}, [installedApps]);
+
 	const runningSuggestions = useMemo(
 		() => runningApps.filter((a) => a.path !== "start" && !pinned.some((p) => isSameApp(p, a))),
 		[runningApps, pinned]
@@ -2326,9 +3243,6 @@ function AddAppPopup({
 
 	const sections = useMemo(() => {
 		const s = debouncedSearch.trim().toLowerCase();
-		// No query: running apps first, then the full installed list.
-		// Already-pinned entries are excluded; backend filters helper junk
-		// (uninstallers, help/readme entries) out of the scan itself.
 		if (!s) {
 			const runningIds = new Set(runningSuggestions.map((a) => itemKey(a)));
 			const rest = apps
@@ -2347,8 +3261,6 @@ function AddAppPopup({
 		const starts: AppInfo[] = [];
 		const contains: AppInfo[] = [];
 		for (const a of apps) {
-			// Search covers everything, including pinned — unlike the browse
-			// view, which skips what's already on the dock.
 			if (a.path === "start") continue;
 			const n = a.name.toLowerCase();
 			if (n.startsWith(s)) starts.push(a);
@@ -2360,40 +3272,12 @@ function AddAppPopup({
 		return [{ title: null, items: [...starts, ...contains].slice(0, 50) }];
 	}, [apps, debouncedSearch, pinned, runningSuggestions]);
 
-	// Flat selectable list; section headers are not selectable.
 	const flat = useMemo(() => sections.flatMap((s) => s.items), [sections]);
 	const flatIndex = useMemo(() => new Map(flat.map((a, i) => [a, i])), [flat]);
 
-	// Keep selection in range as results narrow.
 	useEffect(() => {
 		setSelectedIndex((i) => Math.min(i, Math.max(0, flat.length - 1)));
 	}, [flat.length]);
-
-	// Scroll selected item into view on keyboard nav only — never on mount,
-	// where it yanks the freshly-opened list and reads as jitter.
-	useEffect(() => {
-		if (!mountedRef.current) {
-			mountedRef.current = true;
-			return;
-		}
-		if (!listRef.current) return;
-		const row = listRef.current.querySelector(
-			`[data-idx="${selectedIndex}"]`
-		) as HTMLElement | null;
-		if (row) row.scrollIntoView({ block: "nearest" });
-	}, [selectedIndex]);
-
-	useEffect(() => {
-		const load = async () => {
-			try {
-				const res = await invoke<AppInfo[]>("get_installed_apps");
-				setApps(res.sort((a, b) => a.name.localeCompare(b.name)));
-			} finally {
-				setLoading(false);
-			}
-		};
-		load();
-	}, []);
 
 	useEffect(() => {
 		const handleKeyDown = (e: KeyboardEvent) => {
@@ -2411,32 +3295,14 @@ function AddAppPopup({
 				e.preventDefault();
 				const target = flat[selectedIndex];
 				if (!target) return;
-				// Already on the dock: just dismiss, never pin twice.
 				if (pinned.some((p) => isSameApp(p, target))) onClose();
 				else onAdd(target);
 			}
 		};
-		const handleMouseDown = (e: MouseEvent) => {
-			const popup = containerRef.current;
-			if (popup && !popup.contains(e.target as Node)) {
-				onClose();
-			}
-		};
-		const handleBlur = () => onClose();
 		window.addEventListener("keydown", handleKeyDown);
-		window.addEventListener("blur", handleBlur);
-		document.addEventListener("mousedown", handleMouseDown, true);
-		return () => {
-			window.removeEventListener("keydown", handleKeyDown);
-			window.removeEventListener("blur", handleBlur);
-			document.removeEventListener("mousedown", handleMouseDown, true);
-		};
-	}, [onClose, containerRef, flat, selectedIndex, onAdd, pinned]);
+		return () => window.removeEventListener("keydown", handleKeyDown);
+	}, [onClose, flat, selectedIndex, onAdd, pinned]);
 
-	// Fetch visible icons in parallel and commit as one batch. The old
-	// sequential 20ms-per-icon loop popped icons in one by one, which read as
-	// the list shifting after open. Row and icon boxes are fixed-size and
-	// images fade in via onLoad, so late icons never move layout.
 	useEffect(() => {
 		let active = true;
 		const targets = flat.slice(0, 25).filter((a) => !listIcons[a.path]);
@@ -2446,8 +3312,7 @@ function AddAppPopup({
 				try {
 					const icon = await invoke<string | null>("get_app_icon", { path: app.path });
 					return [app.path, icon] as const;
-				} catch (err) {
-					console.error(err);
+				} catch {
 					return [app.path, null] as const;
 				}
 			})
@@ -2463,103 +3328,63 @@ function AddAppPopup({
 	}, [flat, listIcons]);
 
 	return (
-		<div className="add-popup-anchor" style={{ zoom: scale, bottom }}>
-			<motion.div
-				ref={containerRef}
-				className="add-app-popup"
-				style={{ transformOrigin: "bottom center" }}
-				initial={{ opacity: 0, scaleY: 0 }}
-				animate={{ opacity: 1, scaleY: 1 }}
-				exit={{ opacity: 0, scaleY: 0, transition: { duration: 0.16, ease: "easeIn" } }}
-				transition={{
-					opacity: { duration: 0.15 },
-					scaleY: { type: "spring", stiffness: 300, damping: 28, mass: 0.9 }
-				}}
-				onClick={(e) => e.stopPropagation()}
-			>
-				<div className="popup-search-row">
-					<svg
-						className="popup-search-icon"
-						width="14"
-						height="14"
-						viewBox="0 0 24 24"
-						fill="none"
-						stroke="currentColor"
-						strokeWidth="2"
-						strokeLinecap="round"
-						strokeLinejoin="round"
-					>
-						<circle cx="11" cy="11" r="8" />
-						<line x1="21" y1="21" x2="16.65" y2="16.65" />
-					</svg>
-					<input
-						ref={inputRef}
-						type="text"
-						className="popup-search-input"
-						placeholder="Search apps..."
-						value={search}
-						onChange={(e) => setSearch(e.target.value)}
-					/>
-				</div>
-				<div className="popup-apps-scroll" ref={listRef}>
-					{loading ? (
-						<div aria-hidden>
-							{Array.from({ length: 8 }, (_, i) => (
-								<div className="popup-app-row popup-skeleton-row" key={i}>
-									<div className="popup-app-icon popup-skeleton-box" />
-									<div className="popup-skeleton-line" />
-								</div>
-							))}
-						</div>
-					) : flat.length > 0 ? (
-						sections.map((sec) => (
-							<div key={sec.title ?? "all"}>
-								{sec.title && <div className="popup-section-label">{sec.title}</div>}
-								{sec.items.map((app) => {
-									const gi = flatIndex.get(app) ?? 0;
-									const icon = listIcons[app.path];
-									const alreadyPinned = pinned.some((p) => isSameApp(p, app));
-									return (
-										<div
-											key={`${app.path}::${app.name}`}
-											data-idx={gi}
-											className={`popup-app-row${gi === selectedIndex ? " selected" : ""}${alreadyPinned ? " is-pinned" : ""}`}
-											onClick={() => (alreadyPinned ? onClose() : onAdd(app))}
-											onMouseEnter={() => setSelectedIndex(gi)}
-										>
-											<div className="popup-app-icon">
-												{icon ? (
-													<img
-														key={icon}
-														src={icon}
-														alt=""
-														draggable={false}
-														style={{ opacity: 0 }}
-														onLoad={(e) => {
-															e.currentTarget.style.opacity = "1";
-														}}
-													/>
-												) : (
-													<span className="popup-app-initial">{app.name[0]}</span>
-												)}
-											</div>
-											<span className="popup-app-name">{app.name}</span>
-											<span className="popup-app-pin">{alreadyPinned ? "✓" : "+"}</span>
+		<motion.div
+			ref={panelRef}
+			className="dock-island-panel dock-add-panel"
+			initial={{ opacity: 0, y: 12 }}
+			animate={{ opacity: 1, y: 0 }}
+			exit={{ opacity: 0, y: 8, transition: { duration: 0.12 } }}
+			transition={{ duration: 0.2, ease: "easeOut" }}
+		>
+			<div className="popup-search-row">
+				<Search className="popup-search-icon" size={15} aria-hidden="true" />
+				<input
+					ref={inputRef}
+					type="text"
+					className="popup-search-input"
+					placeholder="Épingler une application au Dock…"
+					value={search}
+					onChange={(e) => setSearch(e.target.value)}
+				/>
+			</div>
+			<div className="popup-apps-scroll" ref={listRef}>
+				{loading ? (
+					<div className="popup-empty">Chargement…</div>
+				) : flat.length > 0 ? (
+					sections.map((sec) => (
+						<div key={sec.title ?? "all"}>
+							{sec.title && <div className="popup-section-label">{sec.title}</div>}
+							{sec.items.map((app) => {
+								const gi = flatIndex.get(app) ?? 0;
+								const icon = listIcons[app.path];
+								const alreadyPinned = pinned.some((p) => isSameApp(p, app));
+								return (
+									<div
+										key={`${app.path}::${app.name}`}
+										data-idx={gi}
+										className={`popup-app-row${gi === selectedIndex ? " selected" : ""}${alreadyPinned ? " is-pinned" : ""}`}
+										onClick={() => (alreadyPinned ? onClose() : onAdd(app))}
+										onMouseEnter={() => setSelectedIndex(gi)}
+									>
+										<div className="popup-app-icon">
+											{icon ? (
+												<img src={icon} alt="" draggable={false} />
+											) : (
+												<span className="popup-app-initial">{app.name[0]}</span>
+											)}
 										</div>
-									);
-								})}
-							</div>
-						))
-					) : (
-						<div className="popup-empty">
-							{debouncedSearch.trim()
-								? "No results"
-								: "Running apps show up here — search to pin anything else"}
+										<span className="popup-app-name">{app.name}</span>
+										<span className="popup-app-pin">{alreadyPinned ? "✓" : "+"}</span>
+									</div>
+								);
+							})}
 						</div>
-					)}
-				</div>
-			</motion.div>
-		</div>
+					))
+				) : (
+					<div className="popup-empty">Aucun résultat</div>
+				)}
+			</div>
+		</motion.div>
 	);
 }
 
