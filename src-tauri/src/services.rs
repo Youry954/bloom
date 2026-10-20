@@ -1601,14 +1601,30 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                                         && (is_client_fullscreen || is_matches_screen)
                                         && !is_maximized_standard;
 
-                                    if is_primary && (current_is_fs || is_maximized) {
+                                    let work_rect = mi.rcWork;
+                                    let bloom_scale =
+                                        crate::utils::get_bloom_scale(&handle_visibility);
+                                    let res_h = crate::utils::dock_reserved_height_px(
+                                        bloom_scale,
+                                        cached_scale,
+                                    );
+                                    let trigger_y =
+                                        (screen_rect.bottom - res_h).min(work_rect.bottom);
+                                    let occupies_work_area = !current_is_fs
+                                        && (rect.right - rect.left)
+                                            >= ((screen_rect.right - screen_rect.left) * 85) / 100
+                                        && rect.bottom >= trigger_y - (4.0 * cached_scale) as i32;
+
+                                    if is_primary
+                                        && (current_is_fs || is_maximized || occupies_work_area)
+                                    {
                                         should_overlap = true;
-                                        should_notch_overlap = true;
-                                        // Standard maximized windows leave the dock's
-                                        // reserved strip empty on both sides, so the dock
-                                        // can stretch to a full taskbar. True fullscreen
-                                        // windows cover the screen and should not.
-                                        should_maximized = is_maximized && !current_is_fs;
+                                        should_notch_overlap = current_is_fs || is_maximized;
+                                        // Standard maximized windows (or windows occupying the work area
+                                        // down to the top of the dock) trigger the 100% full-width taskbar
+                                        // state in Dock.tsx. True fullscreen windows cover the screen and should not.
+                                        should_maximized =
+                                            (is_maximized || occupies_work_area) && !current_is_fs;
                                     } else if is_primary {
                                         should_overlap = false;
                                         if let Ok(dock_rect_lock) = DOCK_RECT.lock() {
@@ -1617,12 +1633,10 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                                                 let d_left = (dr.x as f64 * scale) as i32;
                                                 let d_right =
                                                     d_left + (dr.width as f64 * scale) as i32;
-                                                let res_h = (56.0 * scale) as i32;
-                                                let trigger_y = screen_rect.bottom - res_h;
 
                                                 if rect.left < d_right - 4
                                                     && rect.right > d_left + 4
-                                                    && rect.bottom > trigger_y + 4
+                                                    && rect.bottom > trigger_y
                                                 {
                                                     should_overlap = true;
                                                 }
@@ -1661,6 +1675,110 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                     is_known_shell = false;
                 }
 
+                // If no fullscreen app is active and the foreground window itself wasn't maximized,
+                // check if any visible non-minimized top-level application window on the primary monitor
+                // is maximized or occupies the work area above the dock. This ensures the dock remains
+                // 100% full-width with 0px gap even when a smaller dialog/window is focused in front of
+                // a maximized window or when clicking on the dock itself.
+                if !should_maximized && !current_is_fs {
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        GetDesktopWindow, GetTopWindow, GetWindow, GWL_EXSTYLE, GW_HWNDNEXT,
+                        WS_EX_TOOLWINDOW,
+                    };
+                    let mut scan_hwnd = GetTopWindow(Some(GetDesktopWindow())).unwrap_or_default();
+                    let mut scanned = 0;
+                    while !scan_hwnd.is_invalid() && scanned < 60 {
+                        scanned += 1;
+                        let next_hwnd =
+                            GetWindow(scan_hwnd, GW_HWNDNEXT).unwrap_or_default();
+                        if IsWindowVisible(scan_hwnd).as_bool() && !IsIconic(scan_hwnd).as_bool() {
+                            let mut pid = 0u32;
+                            GetWindowThreadProcessId(scan_hwnd, Some(&mut pid));
+                            if pid != my_process_id {
+                                let mut cname = [0u8; 256];
+                                let clen = windows::Win32::UI::WindowsAndMessaging::GetClassNameA(
+                                    scan_hwnd,
+                                    &mut cname,
+                                );
+                                let cstr =
+                                    std::str::from_utf8(&cname[..clen as usize]).unwrap_or("");
+                                if cstr == "Progman" || cstr == "WorkerW" {
+                                    break;
+                                }
+                                let ex_s = GetWindowLongW(scan_hwnd, GWL_EXSTYLE) as u32;
+                                let s = GetWindowLongW(scan_hwnd, GWL_STYLE) as u32;
+                                if (ex_s & WS_EX_TOOLWINDOW.0) == 0
+                                    && cstr != "Shell_TrayWnd"
+                                    && cstr != "Shell_SecondaryTrayWnd"
+                                    && cstr != "NotifyIconOverflowWindow"
+                                    && cstr != "#32768"
+                                {
+                                    let mut cloaked = 0u32;
+                                    let is_cloaked = DwmGetWindowAttribute(
+                                        scan_hwnd,
+                                        windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+                                        &mut cloaked as *mut _ as *mut _,
+                                        4,
+                                    )
+                                    .is_ok()
+                                        && cloaked != 0;
+                                    if !is_cloaked {
+                                        let h_mon = MonitorFromWindow(
+                                            scan_hwnd,
+                                            MONITOR_DEFAULTTONEAREST,
+                                        );
+                                        let mut mi = MONITORINFO {
+                                            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                                            ..Default::default()
+                                        };
+                                        if GetMonitorInfoA(h_mon, &mut mi).as_bool()
+                                            && is_primary_monitor(mi.dwFlags)
+                                        {
+                                            let zoomed = IsZoomed(scan_hwnd).as_bool()
+                                                || (s & WS_MAXIMIZE.0) != 0;
+                                            if zoomed {
+                                                should_maximized = true;
+                                                break;
+                                            }
+                                            let mut wrect = RECT::default();
+                                            let got_rect = DwmGetWindowAttribute(
+                                                scan_hwnd,
+                                                DWMWA_EXTENDED_FRAME_BOUNDS,
+                                                &mut wrect as *mut _ as *mut _,
+                                                std::mem::size_of::<RECT>() as u32,
+                                            )
+                                            .is_ok()
+                                                || GetWindowRect(scan_hwnd, &mut wrect).is_ok();
+                                            if got_rect {
+                                                let srect = mi.rcMonitor;
+                                                let w_area = mi.rcWork;
+                                                let b_scale = crate::utils::get_bloom_scale(
+                                                    &handle_visibility,
+                                                );
+                                                let r_h = crate::utils::dock_reserved_height_px(
+                                                    b_scale,
+                                                    cached_scale,
+                                                );
+                                                let trig_y =
+                                                    (srect.bottom - r_h).min(w_area.bottom);
+                                                if (wrect.right - wrect.left)
+                                                    >= ((srect.right - srect.left) * 85) / 100
+                                                    && wrect.bottom
+                                                        >= trig_y - (4.0 * cached_scale) as i32
+                                                {
+                                                    should_maximized = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        scan_hwnd = next_hwnd;
+                    }
+                }
+
                 // Only report dock overlap when the dock window is actually visible.
                 // On autostart, the overlap thread starts before init_dock shows the window,
                 // and without this guard it emits dock-overlap:true which hides the dock
@@ -1679,30 +1797,29 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                     .store(if should_notch_overlap { 1 } else { 0 }, Ordering::Relaxed);
                 CURRENT_FOREGROUND_FULLSCREEN.store(current_is_fs, Ordering::Relaxed);
 
-                if Some(effective_dock_overlap) != last_dock_overlap
-                    || last_emit.elapsed() >= Duration::from_secs(3)
-                {
+                let periodic_reemit = last_emit.elapsed() >= Duration::from_secs(3);
+
+                if Some(effective_dock_overlap) != last_dock_overlap || periodic_reemit {
                     let _ = handle_visibility.emit("dock-overlap", effective_dock_overlap);
                     last_dock_overlap = Some(effective_dock_overlap);
-                    last_emit = Instant::now();
                 }
 
-                if Some(should_notch_overlap) != last_notch_overlap
-                    || last_emit.elapsed() >= Duration::from_secs(3)
-                {
+                if Some(should_notch_overlap) != last_notch_overlap || periodic_reemit {
                     let _ = handle_visibility.emit("notch-overlap", should_notch_overlap);
                     last_notch_overlap = Some(should_notch_overlap);
                 }
 
-                // Adaptive dock signal: a standard maximized foreground window.
+                // Adaptive dock signal: a standard maximized window or window occupying the work area.
                 // Unlike dock-overlap this is not guarded by dock visibility, so
                 // init_dock can emit the current value when the dock is enabled.
                 CURRENT_FOREGROUND_MAXIMIZED.store(should_maximized, Ordering::Relaxed);
-                if Some(should_maximized) != last_dock_maximized
-                    || last_emit.elapsed() >= Duration::from_secs(3)
-                {
+                if Some(should_maximized) != last_dock_maximized || periodic_reemit {
                     let _ = handle_visibility.emit("dock-maximized", should_maximized);
                     last_dock_maximized = Some(should_maximized);
+                }
+
+                if periodic_reemit {
+                    last_emit = Instant::now();
                 }
 
                 // Update full-screen visibility (hides TopBar/Corners)
@@ -3782,6 +3899,10 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
             return;
         }
 
+        let scale = monitor.scale_factor();
+        let bloom_scale = crate::utils::get_bloom_scale(window.app_handle());
+        let pr = crate::utils::dock_reserved_height_px(bloom_scale, scale);
+
         // Serialize with disable_dock_appbar, then check the setting again.
         // A pending registration must not outlive a dock-disable request.
         let _guard = lock_dock_appbar();
@@ -3791,6 +3912,10 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
 
         unsafe {
             use windows::Win32::Foundation::RECT;
+            use windows::Win32::UI::Shell::{
+                SHAppBarMessage, ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS,
+                APPBARDATA,
+            };
             use windows::Win32::UI::WindowsAndMessaging::{
                 GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW,
                 SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
@@ -3802,13 +3927,42 @@ fn register_dock_appbar_inner(window: tauri::WebviewWindow, attempt: i32) {
             ex_style |= (WS_EX_TOOLWINDOW.0 | WS_EX_NA.0) as usize;
             let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style as isize);
 
-            // Supprime une éventuelle ancienne réservation avant de repositionner
-            // le dock. Il reste flottant même lorsque son mode est Fixed.
-            unregister_appbar_native(hwnd);
-            DOCK_APPBAR_REGISTERED.store(false, Ordering::Relaxed);
+            // Réserve la zone AppBar inférieure avec 0px d'écart (DOCK_MAXIMIZED_GAP_CSS_PX = 0.0)
+            // entre le bord inférieur des fenêtres maximisées et le bord supérieur du Dock.
+            let mut abd = APPBARDATA {
+                cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+                hWnd: hwnd,
+                uCallbackMessage: 0x8042, // WM_APP + 0x42, reserved for the dock AppBar
+                ..Default::default()
+            };
 
-            // Position absolue : le dock reste en bas sans créer d'AppBar
-            // ni réduire la zone de travail des fenêtres maximisées.
+            if !DOCK_APPBAR_REGISTERED.load(Ordering::Relaxed) {
+                let _ = SHAppBarMessage(ABM_REMOVE, &mut abd);
+                let registered = SHAppBarMessage(ABM_NEW, &mut abd);
+                crate::diagnostics::record(
+                    "dock_appbar",
+                    &format!("registration_result={registered} reserved_px={pr}"),
+                );
+                if registered != 0 {
+                    DOCK_APPBAR_REGISTERED.store(true, Ordering::Relaxed);
+                }
+            }
+
+            if DOCK_APPBAR_REGISTERED.load(Ordering::Relaxed) {
+                abd.uEdge = ABE_BOTTOM;
+                abd.rc = RECT {
+                    left: m_pos.x,
+                    top: m_pos.y + m_size.height as i32 - pr,
+                    right: m_pos.x + m_size.width as i32,
+                    bottom: m_pos.y + m_size.height as i32,
+                };
+                SHAppBarMessage(ABM_QUERYPOS, &mut abd);
+                abd.rc.top = abd.rc.bottom - pr;
+                SHAppBarMessage(ABM_SETPOS, &mut abd);
+            }
+
+            // La fenêtre WebView du Dock conserve sa hauteur complète `ph` pour les popups,
+            // tandis que `abd.rc` réserve uniquement `52px * bloom_scale + 4px` au bas de l'écran.
             let final_y = m_pos.y + m_size.height as i32 - ph;
             let final_x = m_pos.x;
             let final_width = m_size.width as i32;
@@ -4502,14 +4656,17 @@ mod tests {
     }
 
     #[test]
-    fn only_fixed_notch_mode_reserves_the_work_area() {
-        assert!(notch_mode_reserves_work_area(Some("fixed")));
+    fn floating_notch_never_reserves_the_work_area() {
+        // This branch intentionally removed the top AppBar in every mode.
+        // Keep that behavior protected while testing unrelated dock changes.
+        assert!(!notch_mode_reserves_work_area(Some("fixed")));
         assert!(!notch_mode_reserves_work_area(Some("smart")));
         assert!(!notch_mode_reserves_work_area(Some("peek")));
         // Legacy alias for smart
         assert!(!notch_mode_reserves_work_area(Some("auto-hide")));
-        // Unset defaults to fixed, matching SETTINGS.md
-        assert!(notch_mode_reserves_work_area(None));
+        // The default and unknown modes must not bring back the top band.
+        assert!(!notch_mode_reserves_work_area(None));
+        assert!(!notch_mode_reserves_work_area(Some("unknown")));
     }
 
     #[test]

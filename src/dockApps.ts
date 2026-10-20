@@ -16,6 +16,7 @@ export interface TrayApp {
 	path: string;
 	tray_ids: string[];
 	window_handles: number[];
+	icon?: string | null;
 }
 
 const trayPath = (app: TrayApp) => app.path.toLowerCase().replace(/\\/g, "/");
@@ -68,7 +69,7 @@ export function mergeTrayApps(windows: AppInfo[], tray: TrayApp[]): AppInfo[] {
 		result.push({
 			name: app.name,
 			path: app.path,
-			icon: null,
+			icon: app.icon ?? null,
 			is_running: true,
 			is_background: true,
 			all_hwnds: [],

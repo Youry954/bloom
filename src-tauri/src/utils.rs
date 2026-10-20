@@ -1124,6 +1124,29 @@ pub fn replace_settings_cache(new_settings: std::collections::HashMap<String, se
     }
 }
 
+/// Hauteur nominale de la barre du Dock en pixels CSS (8px padding haut + 36px icône + 8px padding bas).
+pub const DOCK_BAR_HEIGHT_CSS_PX: f64 = 52.0;
+
+/// Espacement de 0 pixel CSS entre le bord inférieur des fenêtres
+/// maximisées (zone de travail AppBar) et le bord supérieur du Dock.
+pub const DOCK_MAXIMIZED_GAP_CSS_PX: f64 = 0.0;
+
+/// Calcule la hauteur physique réservée par l'AppBar du Dock (`ABE_BOTTOM`) afin de toucher
+/// parfaitement le bord supérieur du Dock avec 0px d'espace (`DOCK_MAXIMIZED_GAP_CSS_PX = 0.0`).
+pub fn dock_reserved_height_px(bloom_scale: f64, dpi_scale: f64) -> i32 {
+    let scale = if bloom_scale.is_finite() {
+        bloom_scale.clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
+    let dpi = if dpi_scale.is_finite() {
+        dpi_scale.max(0.5)
+    } else {
+        1.0
+    };
+    (((DOCK_BAR_HEIGHT_CSS_PX * scale) + DOCK_MAXIMIZED_GAP_CSS_PX) * dpi).floor() as i32
+}
+
 pub fn get_bloom_scale(_app: &tauri::AppHandle) -> f64 {
     get_setting_str(_app, "bloom-scale")
         .and_then(|s| s.parse::<f64>().ok())
@@ -1589,5 +1612,19 @@ mod tests {
         assert!(!dock_setting_enabled(Some(&serde_json::json!("false"))));
         assert!(!dock_setting_enabled(Some(&serde_json::json!("invalid"))));
         assert!(!dock_setting_enabled(Some(&serde_json::json!(true))));
+    }
+
+    #[test]
+    fn dock_reserved_height_leaves_exact_zero_pixel_gap() {
+        use super::{dock_reserved_height_px, DOCK_BAR_HEIGHT_CSS_PX, DOCK_MAXIMIZED_GAP_CSS_PX};
+
+        // Scale 1.0 @ 100% DPI: 52px dock + 0px gap = 52px
+        assert_eq!(dock_reserved_height_px(1.0, 1.0), 52);
+        // Scale 0.9 @ 100% DPI: (52 * 0.9) = 46.8 -> 46px
+        assert_eq!(dock_reserved_height_px(0.9, 1.0), 46);
+        // Scale 1.0 @ 125% DPI: 52 * 1.25 = 65px
+        assert_eq!(dock_reserved_height_px(1.0, 1.25), 65);
+        assert_eq!(DOCK_BAR_HEIGHT_CSS_PX, 52.0);
+        assert_eq!(DOCK_MAXIMIZED_GAP_CSS_PX, 0.0);
     }
 }
