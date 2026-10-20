@@ -1327,12 +1327,11 @@ pub fn interact(key: &str, context_menu: bool) -> Result<(), String> {
                     let before = if context_menu {
                         visible_windows()
                     } else {
-                        HashMap::new()
+                        Vec::new()
                     };
                     let _ = SetForegroundWindow(hwnd);
-                    let packed_pt = ((cursor.x as u16 as usize)
-                        | ((cursor.y as u16 as usize) << 16))
-                        as usize;
+                    let packed_pt =
+                        (cursor.x as u16 as usize) | ((cursor.y as u16 as usize) << 16);
                     let send_ev = |ev: u32| {
                         if version >= 4 {
                             let lp = ((ev as usize & 0xFFFF)
